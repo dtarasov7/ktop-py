@@ -1,0 +1,46 @@
+@startuml ktop_py_tui_navigation
+title TUI Navigation State Model
+
+skinparam backgroundColor white
+skinparam shadowing false
+
+[*] --> Overview
+
+Overview --> NodeDetail : Enter on node
+Overview --> NamespaceDetail : Enter on namespace\nwhen namespace overview mode is active
+Overview --> PodDetail : Enter on pod
+Overview --> NamespacePicker : 2
+Overview --> Health : h or !
+Overview --> ResourceRisk : z
+Overview --> Diagnostics : x
+Overview --> Help : ?
+Overview --> ObjectViewer : d or y
+Overview --> Overview : g toggles\nnodes/namespaces
+
+NodeDetail --> PodDetail : Enter on pod
+NodeDetail --> ObjectViewer : d or y
+NamespaceDetail --> PodDetail : Enter on pod
+NamespaceDetail --> ObjectViewer : d or y
+PodDetail --> Logs : Enter or l on container
+PodDetail --> NodeDetail : n
+PodDetail --> OwnerView : o
+PodDetail --> ObjectViewer : d or y
+Logs --> ObjectViewer : d or y
+OwnerView --> ObjectViewer : d or y
+
+state "Previous page\nfrom navigation stack" as PreviousPage
+
+NamespacePicker --> PreviousPage : Enter apply namespace
+NamespacePicker --> PreviousPage : Esc
+Health --> PreviousPage : Esc
+ResourceRisk --> PreviousPage : Esc
+Diagnostics --> PreviousPage : Esc
+Help --> PreviousPage : Esc
+ObjectViewer --> PreviousPage : Esc
+Logs --> PodDetail : Esc
+OwnerView --> PodDetail : Esc
+NodeDetail --> Overview : Esc
+NamespaceDetail --> Overview : Esc
+PodDetail --> Overview : Esc through navigation stack
+
+@enduml

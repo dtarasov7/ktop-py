@@ -1,0 +1,40 @@
+@startuml ktop_py_component_architecture
+title ktop-py.py Component Architecture
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+package "Single executable file: ktop-py.py" {
+  component "CLI parser" as Cli
+  component "KtopApp\nTUI state machine" as App
+  component "KubectlClient" as Client
+  component "DemoClient" as Demo
+  component "Snapshot Builder" as Builder
+  component "Metrics Collectors" as Metrics
+  component "Prometheus Parser" as PromParser
+  component "Metrics Server Parser" as MetricsParser
+  component "Renderers\nTables, detail pages, charts" as Renderers
+  component "Text Viewers\nlogs, describe, YAML" as Viewers
+  component "Risk and Diagnostics\nhealth, resource risk, scheduler fit, RBAC checks" as Diagnostics
+  database "Metric history" as History
+}
+
+Cli --> App : parsed args
+Cli --> Client : real cluster mode
+Cli --> Demo : demo mode
+App --> Client : refresh snapshot, logs, describe, YAML
+App --> Demo : synthetic snapshot and logs
+Client --> Metrics : load metrics
+Metrics --> PromParser : kubelet/cAdvisor text
+Metrics --> MetricsParser : metrics.k8s.io JSON
+Client --> Builder : Kubernetes JSON + metrics
+Demo --> Builder : synthetic Kubernetes JSON + metrics
+Builder --> History : retained samples
+History --> Builder : previous samples
+Builder --> App : ClusterSnapshot
+App --> Renderers : overview and details
+App --> Viewers : logs, describe, YAML
+App --> Diagnostics : health, resource risk, scheduler fit, diagnostics
+
+@enduml

@@ -1,0 +1,40 @@
+@startuml ktop_py_component_architecture_ru
+title Компонентная архитектура ktop-py.py
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+package "Один исполняемый файл: ktop-py.py" {
+  component "CLI parser" as Cli
+  component "KtopApp\nмашина состояния TUI" as App
+  component "KubectlClient" as Client
+  component "DemoClient" as Demo
+  component "Snapshot Builder" as Builder
+  component "Сборщики метрик" as Metrics
+  component "Prometheus Parser" as PromParser
+  component "Metrics Server Parser" as MetricsParser
+  component "Renderers\nтаблицы, детали, графики" as Renderers
+  component "Текстовые viewer\nlogs, describe, YAML" as Viewers
+  component "Risk and Diagnostics\nhealth, resource risk, scheduler fit, RBAC checks" as Diagnostics
+  database "История метрик" as History
+}
+
+Cli --> App : parsed args
+Cli --> Client : режим реального кластера
+Cli --> Demo : demo-режим
+App --> Client : refresh snapshot, logs, describe, YAML
+App --> Demo : synthetic snapshot and logs
+Client --> Metrics : загрузка метрик
+Metrics --> PromParser : kubelet/cAdvisor text
+Metrics --> MetricsParser : metrics.k8s.io JSON
+Client --> Builder : Kubernetes JSON + metrics
+Demo --> Builder : synthetic Kubernetes JSON + metrics
+Builder --> History : сохраненные samples
+History --> Builder : предыдущие samples
+Builder --> App : ClusterSnapshot
+App --> Renderers : overview и detail pages
+App --> Viewers : logs, describe, YAML
+App --> Diagnostics : health, resource risk, scheduler fit, diagnostics
+
+@enduml

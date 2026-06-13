@@ -1,0 +1,36 @@
+@startuml ktop_py_snapshot_flow
+title Snapshot Refresh and Metrics Flow
+
+skinparam backgroundColor white
+skinparam shadowing false
+
+start
+:KtopApp schedules refresh;
+if (Refresh already running?) then (yes)
+  :Keep rendering last successful snapshot;
+  stop
+else (no)
+  :Start daemon refresh worker;
+endif
+
+:KubectlClient loads cluster objects;
+:Get nodes, pods, namespaces;
+:Get workloads, ResourceQuotas,\nLimitRanges, PVs, PVCs, and events;
+if (Metrics source) then (prometheus)
+  :Scrape kubelet and cAdvisor through nodes/proxy;
+  :Parse Prometheus text;
+elseif (metrics-server)
+  :Read metrics.k8s.io nodes and pods;
+  :Parse metrics JSON;
+else (none)
+  :Use request and allocatable fallback;
+endif
+
+:Build normalized ClusterSnapshot;
+:Update in-process metric history;
+:Health uses quotas, limit ranges,\nand scheduler-fit checks;
+:Publish snapshot under lock;
+:Header shows loaded, stale, loading, or error state;
+stop
+
+@enduml

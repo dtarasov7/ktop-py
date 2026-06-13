@@ -1,0 +1,30 @@
+@startuml ktop_py_resource_risk_view
+title Resource Risk View Data Flow
+
+skinparam backgroundColor white
+skinparam shadowing false
+
+start
+:User presses z;
+:Open styled Resource Risk page;
+:Read current ClusterSnapshot;
+:Flatten pods to pod/container pairs;
+
+:Find containers without CPU or memory requests;
+:Find containers without CPU or memory limits;
+if (Live metrics available?) then (yes)
+  :Calculate usage/request ratios;
+  :Calculate usage/limit ratios;
+else (no)
+  :Show that live usage ratios are unavailable;
+endif
+:Aggregate top CPU and memory by namespace;
+:Aggregate top CPU and memory by workload owner;
+
+:Render summary cards;
+:Render Missing Requests / Limits,\nHigh Usage Ratios, and Top Consumers panels;
+:Tab or Shift+Tab changes focused panel;
+:Arrow and page keys scroll focused panel;
+stop
+
+@enduml

@@ -1,0 +1,36 @@
+@startuml ktop_py_snapshot_flow_ru
+title Поток обновления snapshot и метрик
+
+skinparam backgroundColor white
+skinparam shadowing false
+
+start
+:KtopApp планирует refresh;
+if (Refresh уже выполняется?) then (да)
+  :Продолжать рисовать последний успешный snapshot;
+  stop
+else (нет)
+  :Запустить daemon refresh worker;
+endif
+
+:KubectlClient загружает объекты кластера;
+:Получить nodes, pods, namespaces;
+:Получить workloads, ResourceQuotas,\nLimitRanges, PVs, PVCs и events;
+if (Источник метрик) then (prometheus)
+  :Scrape kubelet и cAdvisor через nodes/proxy;
+  :Разобрать Prometheus text;
+elseif (metrics-server)
+  :Прочитать metrics.k8s.io nodes и pods;
+  :Разобрать metrics JSON;
+else (none)
+  :Использовать fallback по requests и allocatable;
+endif
+
+:Построить нормализованный ClusterSnapshot;
+:Обновить in-process историю метрик;
+:Health использует quotas, limit ranges\nи scheduler-fit checks;
+:Опубликовать snapshot под lock;
+:Header показывает loaded, stale, loading или error state;
+stop
+
+@enduml

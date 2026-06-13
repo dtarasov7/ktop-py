@@ -1,0 +1,34 @@
+@startuml ktop_py_system_context_ru
+title Контекст системы ktop-py.py
+
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+actor "Оператор" as Operator
+
+rectangle "Терминальная сессия" as Terminal {
+  component "ktop-py.py\nPython 3.8 curses TUI" as App
+}
+
+component "kubectl" as Kubectl
+cloud "Kubernetes API Server" as ApiServer
+component "Metrics Server API\nmetrics.k8s.io" as MetricsServer
+node "Узел Kubernetes" as Node {
+  component "kubelet\n/metrics" as Kubelet
+  component "cAdvisor\n/metrics/cadvisor" as Cadvisor
+}
+
+database "История метрик в процессе\nretention только в памяти" as History
+
+Operator --> App : ввод с клавиатуры
+App --> Terminal : отрисовка curses
+App --> Kubectl : subprocess-вызовы
+Kubectl --> ApiServer : kubeconfig context/user
+ApiServer --> MetricsServer : aggregated metrics API
+ApiServer --> Kubelet : nodes/proxy
+ApiServer --> Cadvisor : nodes/proxy
+App --> History : добавление samples
+History --> App : графики, тренды, максимумы
+
+@enduml
