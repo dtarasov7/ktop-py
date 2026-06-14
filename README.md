@@ -1,6 +1,6 @@
 # ktop-py.py
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG.md)
 
 `ktop-py.py` is a single-file Python 3.8 terminal UI for Kubernetes cluster monitoring. It is inspired by the Go `ktop` project included in the `ktop/` subdirectory, but it is designed for copy-and-run use on machines where installing extra Python packages or copying a compiled binary is inconvenient.
 
@@ -18,6 +18,7 @@ The program is read-only: it inspects Kubernetes objects, metrics, logs, describ
 - Read-only `describe` and YAML viewer for selected nodes, namespaces, pods, and owners.
 - Container logs with current/previous toggle, container switching, timestamps, wrapping, live search/highlight, and plain copy mode.
 - Problems / Health page for runtime issues, resource pressure, ResourceQuota/LimitRange policies, and scheduler-fit checks.
+- CronJob diagnostics with dead-man schedule checks, recent Job success/failure counts, duration percentiles, related pods, events, and suggestions.
 - Resource Risk page for missing requests/limits, usage ratios, and top consumers.
 - Workload / Owner view for pod owner chains and controlled pods.
 - Metrics / RBAC diagnostics from TUI or CLI.
@@ -93,6 +94,7 @@ Run built-in offline checks:
 | `Tab` / `Shift+Tab` | Cycle focus between overview tables, or between panels on Health / Resource Risk |
 | `Left` / `Right` | Scroll the focused table horizontally |
 | `g` | Toggle the overview primary table between nodes and namespaces |
+| `j` | Open CronJob diagnostics |
 | `2` | Open namespace picker |
 | `/` | Edit table filter, or live search in logs/describe/YAML |
 | `Enter` | Open selected node, namespace, pod, or container logs |
@@ -110,9 +112,11 @@ Column hotkeys sort the focused table. For example, `c` sorts by CPU, `m` by mem
 
 Problems / Health uses the same panel navigation as Resource Risk: `Tab` / `Shift+Tab` changes the focused panel, `Up` / `Down` scrolls rows, and `Left` / `Right` scrolls wide rows horizontally.
 
+CronJob diagnostics are read-only and use loaded `cronjobs`, `jobs`, `pods`, and `events`. The `j` page highlights missed schedules, failed latest Jobs, long-running Jobs, and duration regressions. `Enter` opens a CronJob detail page with SLA percentiles, related pods, recent Jobs, events, and suggested next checks.
+
 Health resource pressure separates different signals: memory usage and memory requests are treated as stronger capacity risks, CPU requests are a softer planning signal, and limits above allocatable are shown as overcommit warnings rather than critical failures. ResourceQuota is evaluated against `status.used/status.hard`; LimitRange rows show namespace resource policy defaults and bounds.
 
-For complete Health output, the kubeconfig user should be able to list `resourcequotas` and `limitranges` in addition to the usual nodes, pods, workloads, events, PVs, and PVCs. Missing optional permissions are reported as collection warnings.
+For complete Health and CronJob output, the kubeconfig user should be able to list `resourcequotas`, `limitranges`, `jobs`, and `cronjobs` in addition to the usual nodes, pods, workloads, events, PVs, and PVCs. Missing optional permissions are reported as collection warnings.
 
 ## Metrics
 
@@ -162,6 +166,8 @@ When connecting from Windows through PuTTY, choose a font that includes these gl
 ```
 
 By default, raw Kubernetes objects are omitted. Add `--include-raw` only when you really need them.
+
+JSON output includes a `cronjobs` section with schedule status, last/next schedule, late seconds, success/failure counts, P50/P95/P99 duration values, latest Job status, severity, and suggestions.
 
 ## Documentation
 

@@ -33,11 +33,11 @@ import textwrap
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "1.0.0"
-__VERSION__ = "1.0.0"
+VERSION = "1.1.0"
+__VERSION__ = "1.1.0"
 __AUTHOR__ = "Tarasov Dmitry"
 
 MIN_ROWS = 22
@@ -49,6 +49,7 @@ RATE_CHART_MIN_BYTES_PER_SECOND = 512.0 * 1024.0
 METRIC_PANEL_INNER_HEIGHT = 5
 METRIC_PANEL_HEIGHT = METRIC_PANEL_INNER_HEIGHT + 2
 DEFAULT_DUMP_GRAPH_WIDTH = 10
+MAX_SEARCH_REGEX_LENGTH = 128
 DEFAULT_GRAPH_STYLE = os.environ.get("KTOP_PY_GRAPH_STYLE", "unicode").lower()
 if DEFAULT_GRAPH_STYLE not in ("ascii", "unicode"):
     DEFAULT_GRAPH_STYLE = "unicode"
@@ -58,6 +59,7 @@ NODE_DEFAULT_COLUMNS = ["NAME", "STATUS", "RST", "PODS", "TAINTS", "PRESSURE", "
 NODE_COLUMNS = NODE_DEFAULT_COLUMNS + ["NET", "IO"]
 NAMESPACE_COLUMNS = ["NAMESPACE", "STATUS", "PODS", "READY", "RST", "FAIL", "CPU", "MEMORY"] + RATE_DETAIL_COLUMNS
 POD_COLUMNS = ["NAMESPACE", "POD", "READY", "STATUS", "RST", "AGE", "VOLS", "IP", "NODE", "CPU", "MEMORY"]
+CRONJOB_COLUMNS = ["NAMESPACE", "NAME", "SCHEDULE", "TZ", "SUSP", "LAST", "NEXT", "LATE", "ACTIVE", "OK", "FAIL", "P50", "P95", "P99", "STATUS", "HINT"]
 RESOURCE_PANEL_KEYS = ["resource_missing", "resource_ratios", "resource_top"]
 HEALTH_PANEL_KEYS = ["health_runtime", "health_workloads", "health_resources"]
 
@@ -104,6 +106,18 @@ NAMESPACE_SORT_KEYS = {
     "e": "NET RX",
     "o": "DISK R",
     "w": "DISK W",
+}
+
+CRONJOB_SORT_KEYS = {
+    "n": "NAMESPACE",
+    "j": "NAME",
+    "s": "STATUS",
+    "l": "LAST",
+    "x": "NEXT",
+    "a": "ACTIVE",
+    "o": "OK",
+    "f": "FAIL",
+    "p": "P95",
 }
 
 # Keyboard input is normalized before command handling.
@@ -384,6 +398,65 @@ class WorkloadRow:
 
 
 @dataclass
+class CronJobRunRow:
+    """One Job execution owned by a CronJob. / Один запуск Job, принадлежащий CronJob."""
+
+    namespace: str
+    name: str
+    cronjob: str
+    status: str
+    start_time: Optional[dt.datetime]
+    completion_time: Optional[dt.datetime]
+    duration_s: Optional[float]
+    active: int
+    succeeded: int
+    failed: int
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CronScheduleSpec:
+    """Parsed five-field Cron schedule. / Разобранное cron-расписание из пяти полей."""
+
+    minutes: Set[int]
+    hours: Set[int]
+    days: Set[int]
+    months: Set[int]
+    weekdays: Set[int]
+    day_any: bool
+    weekday_any: bool
+
+
+@dataclass
+class CronJobRow:
+    """CronJob SLA/dead-man diagnostics row. / Строка диагностики CronJob SLA/dead-man."""
+
+    namespace: str
+    name: str
+    schedule: str
+    timezone: str
+    suspend: bool
+    last_schedule: Optional[dt.datetime]
+    last_success: Optional[dt.datetime]
+    next_schedule: Optional[dt.datetime]
+    late_seconds: float
+    active: int
+    succeeded: int
+    failed: int
+    p50_s: Optional[float]
+    p95_s: Optional[float]
+    p99_s: Optional[float]
+    latest_job: str
+    latest_status: str
+    status: str
+    severity: str
+    hint: str
+    suggestions: List[str] = field(default_factory=list)
+    parse_error: str = ""
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class DiagnosticResult:
     """Single diagnostics check result. / Результат одной диагностической проверки."""
 
@@ -402,6 +475,7 @@ class HealthData:
     node_findings: List[Tuple[str, str]]
     pod_findings: List[Tuple[str, str]]
     workload_findings: List[Tuple[str, str]]
+    cronjob_findings: List[Tuple[str, str]]
     event_findings: List[Tuple[str, str]]
     collection_warnings: List[Tuple[str, str]]
     resource_findings: List[Tuple[str, str]]
@@ -488,6 +562,9 @@ class ResourceUsage:
 
 _QUANTITY_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)([a-zA-Z]*)\s*$")
 _DURATION_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)(ms|s|m|h)?\s*$")
+_REGEX_REPEAT_ATOM = r"(?:[+*]|\{\d+(?:,\d*)?\})"
+_REGEX_NESTED_REPEAT_RE = re.compile(r"\((?:[^()\\]|\\.)*%s(?:[^()\\]|\\.)*\)\s*%s" % (_REGEX_REPEAT_ATOM, _REGEX_REPEAT_ATOM))
+_REGEX_REPEATED_ALT_RE = re.compile(r"\((?:[^()\\]|\\.)+\|(?:[^()\\]|\\.)+\)\s*%s" % _REGEX_REPEAT_ATOM)
 
 
 def parse_duration_seconds(value: Any) -> float:
@@ -753,6 +830,36 @@ def human_age(start: Optional[dt.datetime], now: Optional[dt.datetime] = None) -
     return "%ds" % seconds
 
 
+def sanitize_terminal_text(text: Any) -> str:
+    """Escape control characters before terminal rendering. / Экранирует control chars для TUI.
+
+    Args:
+        text: Value to render.
+    Returns:
+        Printable text where terminal control bytes are visible and inert.
+    """
+    result: List[str] = []
+    for char in str(text):
+        code = ord(char)
+        if char == "\n":
+            result.append(" ")
+        elif char == "\t":
+            result.append(" ")
+        elif char == "\r":
+            result.append("^M")
+        elif code == 0x1B:
+            result.append("^[")
+        elif code < 32:
+            result.append("^" + chr(code + 64))
+        elif code == 127:
+            result.append("^?")
+        elif 0x80 <= code <= 0x9F:
+            result.append("\\x%02X" % code)
+        else:
+            result.append(char)
+    return "".join(result)
+
+
 def truncate(text: Any, width: int) -> str:
     """Trim text to a terminal cell width. / Обрезает текст под ширину терминала.
 
@@ -764,8 +871,7 @@ def truncate(text: Any, width: int) -> str:
     """
     if width <= 0:
         return ""
-    value = str(text)
-    value = value.replace("\n", " ").replace("\t", " ")
+    value = sanitize_terminal_text(text)
     if len(value) <= width:
         return value
     if width <= 1:
@@ -1650,6 +1756,417 @@ def render_sparkline(values: Sequence[float], width: int = 10) -> str:
     return "".join(SPARKLINE_LEVELS[int(round((value - low) * scale))] for value in clean)
 
 
+_CRON_MACROS = {
+    "@yearly": "0 0 1 1 *",
+    "@annually": "0 0 1 1 *",
+    "@monthly": "0 0 1 * *",
+    "@weekly": "0 0 * * 0",
+    "@daily": "0 0 * * *",
+    "@midnight": "0 0 * * *",
+    "@hourly": "0 * * * *",
+}
+_CRON_MONTH_NAMES = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+_CRON_WEEKDAY_NAMES = {
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
+}
+
+
+def cron_token_value(token: str, names: Optional[Dict[str, int]], sunday_alias: bool) -> int:
+    """Parse one cron token. / Разбирает один token cron-поля.
+
+    Args:
+        token: Numeric token or known month/weekday name.
+        names: Optional name lookup.
+        sunday_alias: Whether ``7`` should mean Sunday.
+    Returns:
+        Integer field value.
+    Raises:
+        ValueError: If the token is unsupported.
+    """
+    value = token.strip().lower()
+    if names and value in names:
+        return names[value]
+    parsed = int(value)
+    if sunday_alias and parsed == 7:
+        return 0
+    return parsed
+
+
+def cron_field_values(
+    field: str,
+    minimum: int,
+    maximum: int,
+    names: Optional[Dict[str, int]] = None,
+    allow_question: bool = False,
+    sunday_alias: bool = False,
+) -> Tuple[Set[int], bool]:
+    """Parse one cron field. / Разбирает одно cron-поле.
+
+    Args:
+        field: Cron field text.
+        minimum: Inclusive lower bound.
+        maximum: Inclusive upper bound.
+        names: Optional month or weekday names.
+        allow_question: Whether ``?`` is accepted as wildcard.
+        sunday_alias: Whether weekday ``7`` is treated as ``0``.
+    Returns:
+        Allowed values and wildcard flag.
+    Raises:
+        ValueError: If syntax or values are unsupported.
+    """
+    field = str(field or "").strip().lower()
+    if field == "*" or (allow_question and field == "?"):
+        return set(range(minimum, maximum + 1)), True
+    if not field:
+        raise ValueError("empty cron field")
+    values: Set[int] = set()
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError("empty cron field item")
+        base = part
+        step = 1
+        has_step = False
+        if "/" in part:
+            base, step_text = part.split("/", 1)
+            step = int(step_text)
+            has_step = True
+            if step <= 0:
+                raise ValueError("invalid cron step %s" % step_text)
+        if base == "*" or (allow_question and base == "?"):
+            start, end = minimum, maximum
+        elif "-" in base:
+            left, right = base.split("-", 1)
+            start = cron_token_value(left, names, sunday_alias)
+            end = cron_token_value(right, names, sunday_alias)
+        else:
+            start = cron_token_value(base, names, sunday_alias)
+            end = maximum if has_step else start
+        if start < minimum or start > maximum or end < minimum or end > maximum:
+            raise ValueError("cron value out of range")
+        if start > end:
+            raise ValueError("reversed cron range")
+        values.update(range(start, end + 1, step))
+    return values, False
+
+
+def parse_cron_schedule(schedule: str) -> CronScheduleSpec:
+    """Parse a Kubernetes CronJob schedule. / Разбирает расписание Kubernetes CronJob.
+
+    Args:
+        schedule: Five-field cron string or supported macro.
+    Returns:
+        CronScheduleSpec with allowed values.
+    Raises:
+        ValueError: If the schedule is unsupported.
+    """
+    text = str(schedule or "").strip().lower()
+    text = _CRON_MACROS.get(text, text)
+    parts = text.split()
+    if len(parts) != 5:
+        raise ValueError("expected five cron fields")
+    minutes, _minute_any = cron_field_values(parts[0], 0, 59)
+    hours, _hour_any = cron_field_values(parts[1], 0, 23)
+    days, day_any = cron_field_values(parts[2], 1, 31, allow_question=True)
+    months, _month_any = cron_field_values(parts[3], 1, 12, names=_CRON_MONTH_NAMES)
+    weekdays, weekday_any = cron_field_values(parts[4], 0, 6, names=_CRON_WEEKDAY_NAMES, allow_question=True, sunday_alias=True)
+    return CronScheduleSpec(minutes, hours, days, months, weekdays, day_any, weekday_any)
+
+
+def cron_day_matches(moment: dt.datetime, spec: CronScheduleSpec) -> bool:
+    """Check cron day-of-month/week semantics. / Проверяет cron day-of-month/week semantics."""
+    day_match = moment.day in spec.days
+    weekday = (moment.weekday() + 1) % 7
+    weekday_match = weekday in spec.weekdays
+    if spec.day_any and spec.weekday_any:
+        return True
+    if spec.day_any:
+        return weekday_match
+    if spec.weekday_any:
+        return day_match
+    return day_match or weekday_match
+
+
+def cron_schedule_reference(now: dt.datetime, timezone_name: str) -> Tuple[dt.datetime, str]:
+    """Convert reference time to a CronJob timezone. / Переводит reference time в timezone CronJob.
+
+    Args:
+        now: UTC or timezone-aware reference time.
+        timezone_name: ``spec.timeZone`` value.
+    Returns:
+        Localized time and warning text when named timezone support is unavailable.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.timezone.utc)
+    name = (timezone_name or "").strip()
+    if not name:
+        return now.astimezone(), ""
+    if name.upper() in ("UTC", "ETC/UTC", "GMT", "ETC/GMT", "Z"):
+        return now.astimezone(dt.timezone.utc), ""
+    return now.astimezone(), "timezone %s approximated as local time" % name
+
+
+def cron_next_after(schedule: str, after: dt.datetime, timezone_name: str = "", max_days: int = 366) -> Tuple[Optional[dt.datetime], str]:
+    """Find the next matching cron time. / Находит следующее срабатывание cron.
+
+    Args:
+        schedule: Kubernetes CronJob schedule.
+        after: Reference time; result is strictly after it.
+        timezone_name: Optional CronJob timezone.
+        max_days: Search horizon.
+    Returns:
+        Next UTC datetime and parse/search warning.
+    """
+    try:
+        spec = parse_cron_schedule(schedule)
+    except ValueError as exc:
+        return None, str(exc)
+    local_after, timezone_warning = cron_schedule_reference(after, timezone_name)
+    cursor = local_after.replace(second=0, microsecond=0) + dt.timedelta(minutes=1)
+    end = cursor + dt.timedelta(days=max(1, max_days))
+    minutes = sorted(spec.minutes)
+    hours = sorted(spec.hours)
+    day = cursor.date()
+    while day <= end.date():
+        base = dt.datetime.combine(day, dt.time(0, 0), tzinfo=cursor.tzinfo)
+        if base.month not in spec.months or not cron_day_matches(base, spec):
+            day = day + dt.timedelta(days=1)
+            continue
+        for hour in hours:
+            if day == cursor.date() and hour < cursor.hour:
+                continue
+            for minute in minutes:
+                candidate = base.replace(hour=hour, minute=minute)
+                if candidate <= local_after or candidate < cursor or candidate > end:
+                    continue
+                return candidate.astimezone(dt.timezone.utc), timezone_warning
+        day = day + dt.timedelta(days=1)
+    return None, "no matching cron time within %dd" % max_days
+
+
+def percentile(values: Sequence[float], pct: float) -> Optional[float]:
+    """Calculate a nearest-rank percentile. / Считает percentile методом nearest-rank.
+
+    Args:
+        values: Numeric sample values.
+        pct: Percentile in 0..100.
+    Returns:
+        Percentile value or None for empty input.
+    """
+    clean = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not clean:
+        return None
+    pct = max(0.0, min(100.0, pct))
+    if len(clean) == 1:
+        return clean[0]
+    index = int(math.ceil((pct / 100.0) * len(clean))) - 1
+    return clean[max(0, min(len(clean) - 1, index))]
+
+
+def format_duration_compact(seconds: Optional[float]) -> str:
+    """Format duration seconds for narrow tables. / Форматирует длительность для узких таблиц."""
+    if seconds is None or not math.isfinite(float(seconds)):
+        return "-"
+    seconds_i = max(0, int(round(float(seconds))))
+    if seconds_i >= 86400:
+        days, rem = divmod(seconds_i, 86400)
+        hours = rem // 3600
+        return "%dd%dh" % (days, hours) if hours else "%dd" % days
+    if seconds_i >= 3600:
+        hours, rem = divmod(seconds_i, 3600)
+        minutes = rem // 60
+        return "%dh%dm" % (hours, minutes) if minutes else "%dh" % hours
+    if seconds_i >= 60:
+        minutes, seconds_i = divmod(seconds_i, 60)
+        return "%dm%ds" % (minutes, seconds_i) if seconds_i else "%dm" % minutes
+    return "%ds" % seconds_i
+
+
+def job_completion_time(raw: Dict[str, Any]) -> Optional[dt.datetime]:
+    """Return Job completion/failure timestamp. / Возвращает время завершения или ошибки Job."""
+    value = parse_rfc3339(safe_get(raw, ["status", "completionTime"]))
+    if value:
+        return value
+    for condition in safe_get(raw, ["status", "conditions"], []) or []:
+        if condition.get("status") == "True" and condition.get("type") in ("Complete", "Failed"):
+            value = parse_rfc3339(condition.get("lastTransitionTime"))
+            if value:
+                return value
+    return None
+
+
+def job_run_from_workload(workload: WorkloadRow, now: Optional[dt.datetime] = None) -> Optional[CronJobRunRow]:
+    """Convert an owned Job workload to a CronJob run. / Преобразует Job workload в запуск CronJob.
+
+    Args:
+        workload: Job workload row.
+        now: Reference time for active duration.
+    Returns:
+        CronJobRunRow, or None when Job is not owned by a CronJob.
+    """
+    if workload.kind != "Job" or workload.owner_kind != "CronJob" or not workload.owner_name:
+        return None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    raw = workload.raw
+    start = parse_rfc3339(safe_get(raw, ["status", "startTime"]))
+    completion = job_completion_time(raw)
+    duration = None
+    if start and completion:
+        duration = max(0.0, (completion - start).total_seconds())
+    elif start and workload.status == "Active":
+        duration = max(0.0, (now - start).total_seconds())
+    return CronJobRunRow(
+        namespace=workload.namespace,
+        name=workload.name,
+        cronjob=workload.owner_name,
+        status=workload.status,
+        start_time=start,
+        completion_time=completion,
+        duration_s=duration,
+        active=int_value(safe_get(raw, ["status", "active"], 0)),
+        succeeded=int_value(safe_get(raw, ["status", "succeeded"], 0)),
+        failed=int_value(safe_get(raw, ["status", "failed"], 0)),
+        raw=raw,
+    )
+
+
+def build_cronjob_rows(snapshot: ClusterSnapshot, now: Optional[dt.datetime] = None) -> List[CronJobRow]:
+    """Build CronJob SLA/dead-man rows from a snapshot. / Строит строки CronJob SLA/dead-man из snapshot.
+
+    Args:
+        snapshot: Current cluster snapshot.
+        now: Optional reference time for deterministic tests.
+    Returns:
+        Sorted CronJob diagnostic rows.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    runs_by_key: Dict[Tuple[str, str], List[CronJobRunRow]] = {}
+    for workload in snapshot.workloads.values():
+        run = job_run_from_workload(workload, now)
+        if run:
+            runs_by_key.setdefault((run.namespace, run.cronjob), []).append(run)
+    for runs in runs_by_key.values():
+        runs.sort(key=lambda item: item.start_time or item.completion_time or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
+
+    rows: List[CronJobRow] = []
+    for workload in sorted(snapshot.workloads.values(), key=lambda item: (item.namespace, item.name)):
+        if workload.kind != "CronJob":
+            continue
+        raw = workload.raw
+        key = (workload.namespace, workload.name)
+        runs = runs_by_key.get(key, [])
+        schedule = safe_get(raw, ["spec", "schedule"], "-") or "-"
+        timezone_name = safe_get(raw, ["spec", "timeZone"], "") or ""
+        suspend = bool(safe_get(raw, ["spec", "suspend"], False))
+        created_at = parse_rfc3339(safe_get(raw, ["metadata", "creationTimestamp"]))
+        last_schedule = parse_rfc3339(safe_get(raw, ["status", "lastScheduleTime"]))
+        last_success = parse_rfc3339(safe_get(raw, ["status", "lastSuccessfulTime"]))
+        reference = last_schedule or created_at or now
+        next_schedule, parse_error = cron_next_after(schedule, reference, timezone_name)
+        active = len(safe_get(raw, ["status", "active"], []) or [])
+        succeeded = sum(1 for run in runs if run.status in ("Complete", "Completed") or run.succeeded)
+        failed = sum(1 for run in runs if run.status == "Failed" or run.failed)
+        completed_durations = [run.duration_s for run in runs if run.duration_s is not None and run.status in ("Complete", "Completed")]
+        p50 = percentile(completed_durations, 50.0)
+        p95 = percentile(completed_durations, 95.0)
+        p99 = percentile(completed_durations, 99.0)
+        latest = runs[0] if runs else None
+        latest_job = latest.name if latest else "-"
+        latest_status = latest.status if latest else "-"
+        starting_deadline = int_value(safe_get(raw, ["spec", "startingDeadlineSeconds"], 0), 0)
+        late_seconds = 0.0
+        if next_schedule and next_schedule < now:
+            late_seconds = max(0.0, (now - next_schedule).total_seconds())
+        grace = float(max(60, starting_deadline or 300))
+        suggestions: List[str] = []
+        status = "OK"
+        severity = "ok"
+        hint = parse_error or "on schedule"
+
+        if suspend:
+            status = "Suspended"
+            severity = "warning"
+            hint = "suspended"
+            suggestions.append("Unsuspend the CronJob when scheduled runs should resume.")
+        elif parse_error and not next_schedule:
+            status = "Unknown"
+            severity = "warning"
+            hint = parse_error
+            suggestions.append("Check spec.schedule/spec.timeZone; ktop-py.py supports standard five-field cron syntax.")
+        elif late_seconds > grace:
+            status = "Missed"
+            severity = "critical"
+            hint = "late %s" % format_duration_compact(late_seconds)
+            suggestions.append("Check kube-controller-manager, CronJob suspend flag, startingDeadlineSeconds, and recent events.")
+        elif latest and (latest.status == "Failed" or latest.failed):
+            status = "Failed"
+            severity = "critical"
+            hint = "latest job failed"
+            suggestions.append("Open the CronJob detail, inspect related pod events, then use Enter/l for logs.")
+        elif latest and latest.status == "Active" and latest.duration_s is not None and p95 and latest.duration_s > max(p95 * 2.0, p95 + 300.0):
+            status = "LongRunning"
+            severity = "warning"
+            hint = "active %s > p95 %s" % (format_duration_compact(latest.duration_s), format_duration_compact(p95))
+            suggestions.append("Compare this active run with previous durations and check pod logs/events.")
+        elif latest and latest.duration_s is not None and p95 and len(completed_durations) >= 4 and latest.duration_s > max(p95 * 1.5, p95 + 120.0):
+            status = "Slow"
+            severity = "warning"
+            hint = "duration regression"
+            suggestions.append("Review recent logs and external dependencies; latest duration is above historical p95.")
+        elif active:
+            status = "Active"
+            severity = "ok"
+            hint = "running"
+
+        rows.append(
+            CronJobRow(
+                namespace=workload.namespace,
+                name=workload.name,
+                schedule=schedule,
+                timezone=timezone_name or "-",
+                suspend=suspend,
+                last_schedule=last_schedule,
+                last_success=last_success,
+                next_schedule=next_schedule,
+                late_seconds=late_seconds,
+                active=active,
+                succeeded=succeeded,
+                failed=failed,
+                p50_s=p50,
+                p95_s=p95,
+                p99_s=p99,
+                latest_job=latest_job,
+                latest_status=latest_status,
+                status=status,
+                severity=severity,
+                hint=hint,
+                suggestions=suggestions,
+                parse_error=parse_error,
+                raw=raw,
+            )
+        )
+    return rows
+
+
 def make_events(events_json: Optional[Dict[str, Any]]) -> List[EventInfo]:
     """Normalize Kubernetes events. / Нормализует Kubernetes events.
 
@@ -2008,7 +2525,8 @@ class KubectlClient:
         """
         cmd = self.base_cmd() + list(args)
         try:
-            completed = subprocess.run(
+            # kubectl is executed as an argv list with shell disabled.
+            completed = subprocess.run(  # nosec B603
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -2852,6 +3370,104 @@ class DemoClient:
             ]
         }
         empty_workloads = {"items": []}
+        now = dt.datetime.now(dt.timezone.utc)
+        last_cron_slot = now.replace(second=0, microsecond=0) - dt.timedelta(minutes=now.minute % 15)
+        cronjobs_json = {
+            "items": [
+                {
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "nightly-backup",
+                        "creationTimestamp": (now - dt.timedelta(hours=12)).isoformat().replace("+00:00", "Z"),
+                    },
+                    "spec": {"schedule": "*/15 * * * *", "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 1},
+                    "status": {
+                        "lastScheduleTime": last_cron_slot.isoformat().replace("+00:00", "Z"),
+                        "lastSuccessfulTime": last_cron_slot.isoformat().replace("+00:00", "Z"),
+                    },
+                }
+            ]
+        }
+        jobs_json = {
+            "items": [
+                {
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "nightly-backup-001",
+                        "creationTimestamp": (last_cron_slot - dt.timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
+                        "ownerReferences": [{"apiVersion": "batch/v1", "kind": "CronJob", "name": "nightly-backup", "controller": True}],
+                    },
+                    "spec": {"completions": 1, "parallelism": 1},
+                    "status": {
+                        "startTime": (last_cron_slot - dt.timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
+                        "completionTime": last_cron_slot.isoformat().replace("+00:00", "Z"),
+                        "succeeded": 1,
+                        "conditions": [{"type": "Complete", "status": "True", "lastTransitionTime": last_cron_slot.isoformat().replace("+00:00", "Z")}],
+                    },
+                },
+                {
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "nightly-backup-000",
+                        "creationTimestamp": (last_cron_slot - dt.timedelta(minutes=18)).isoformat().replace("+00:00", "Z"),
+                        "ownerReferences": [{"apiVersion": "batch/v1", "kind": "CronJob", "name": "nightly-backup", "controller": True}],
+                    },
+                    "spec": {"completions": 1, "parallelism": 1},
+                    "status": {
+                        "startTime": (last_cron_slot - dt.timedelta(minutes=18)).isoformat().replace("+00:00", "Z"),
+                        "completionTime": (last_cron_slot - dt.timedelta(minutes=15)).isoformat().replace("+00:00", "Z"),
+                        "succeeded": 1,
+                        "conditions": [{"type": "Complete", "status": "True", "lastTransitionTime": (last_cron_slot - dt.timedelta(minutes=15)).isoformat().replace("+00:00", "Z")}],
+                    },
+                },
+            ]
+        }
+        pods_json["items"].append(
+            {
+                "metadata": {
+                    "namespace": "default",
+                    "name": "nightly-backup-001-pod",
+                    "creationTimestamp": (last_cron_slot - dt.timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
+                    "ownerReferences": [{"apiVersion": "batch/v1", "kind": "Job", "name": "nightly-backup-001", "controller": True}],
+                },
+                "spec": {
+                    "nodeName": "worker-a",
+                    "containers": [
+                        {
+                            "name": "backup",
+                            "image": "registry.local/backup:demo",
+                            "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "512Mi"}},
+                        }
+                    ],
+                },
+                "status": {
+                    "phase": "Succeeded",
+                    "podIP": "10.244.1.55",
+                    "conditions": [
+                        {"type": "Initialized", "status": "True", "reason": "PodCompleted"},
+                        {"type": "Ready", "status": "False", "reason": "PodCompleted"},
+                        {"type": "PodScheduled", "status": "True", "reason": "Scheduled"},
+                    ],
+                    "containerStatuses": [
+                        {
+                            "name": "backup",
+                            "ready": False,
+                            "restartCount": 0,
+                            "state": {"terminated": {"reason": "Completed"}},
+                        }
+                    ],
+                },
+            }
+        )
+        events_json["items"].append(
+            {
+                "metadata": {"namespace": "default", "creationTimestamp": now.isoformat().replace("+00:00", "Z")},
+                "involvedObject": {"kind": "CronJob", "namespace": "default", "name": "nightly-backup"},
+                "reason": "SawCompletedJob",
+                "type": "Normal",
+                "message": "Demo CronJob completed successfully",
+            }
+        )
         node_metrics = {
             "minikube": ResourceUsage(239.0, parse_bytes("1502Mi"), parse_bytes("1.2Mi"), parse_bytes("420Ki"), parse_bytes("250Ki"), parse_bytes("80Ki")),
             "worker-a": ResourceUsage(680.0, parse_bytes("3800Mi"), parse_bytes("2.8Mi"), parse_bytes("1.1Mi"), parse_bytes("760Ki"), parse_bytes("140Ki")),
@@ -2862,10 +3478,12 @@ class DemoClient:
             ("kube-system", "kube-apiserver-minikube"): ResourceUsage(52.0, parse_bytes("291Mi")),
             ("default", "web-5d77b679d9-xbzqs"): ResourceUsage(126.0, parse_bytes("180Mi"), parse_bytes("940Ki"), parse_bytes("280Ki"), parse_bytes("92Ki"), parse_bytes("25Ki")),
             ("default", "api-7bf6b99795-pnn5q"): ResourceUsage(260.0, parse_bytes("420Mi"), parse_bytes("1.7Mi"), parse_bytes("530Ki"), parse_bytes("420Ki"), parse_bytes("70Ki")),
+            ("default", "nightly-backup-001-pod"): ResourceUsage(18.0, parse_bytes("90Mi"), parse_bytes("120Ki"), parse_bytes("40Ki"), parse_bytes("14Ki"), parse_bytes("8Ki")),
         }
         container_metrics = {
             ("default", "web-5d77b679d9-xbzqs", "web"): ResourceUsage(126.0, parse_bytes("180Mi")),
             ("default", "api-7bf6b99795-pnn5q", "api"): ResourceUsage(260.0, parse_bytes("420Mi")),
+            ("default", "nightly-backup-001-pod", "backup"): ResourceUsage(18.0, parse_bytes("90Mi")),
         }
         return build_snapshot(
             nodes_json,
@@ -2874,8 +3492,8 @@ class DemoClient:
             replicasets_json,
             empty_workloads,
             empty_workloads,
-            empty_workloads,
-            empty_workloads,
+            jobs_json,
+            cronjobs_json,
             namespaces_json,
             resourcequotas_json,
             limitranges_json,
@@ -3183,17 +3801,24 @@ def demo_json(started: dt.datetime) -> Tuple[Dict[str, Any], Dict[str, Any], Dic
 
 def status_rank(status: str) -> int:
     order = {
+        "OK": 0,
         "Active": 0,
+        "Idle": 0,
         "Ready": 0,
         "Running": 0,
         "Completed": 1,
+        "Complete": 1,
         "NotReady": 2,
+        "Suspended": 2,
+        "Slow": 2,
+        "LongRunning": 2,
         "Pending": 3,
         "ContainerCreating": 3,
         "Terminating": 4,
         "CrashLoopBackOff": 5,
         "Error": 6,
         "Failed": 7,
+        "Missed": 7,
         "Unknown": 8,
     }
     return order.get(status, 9)
@@ -3323,11 +3948,61 @@ def sort_namespaces(namespaces: List[NamespaceRow], column: str, ascending: bool
     return sorted(namespaces, key=key, reverse=not ascending)
 
 
+def sort_cronjobs(rows: List[CronJobRow], column: str, ascending: bool) -> List[CronJobRow]:
+    """Sort CronJob diagnostic rows. / Сортирует строки диагностики CronJob.
+
+    Args:
+        rows: CronJob rows.
+        column: Column name.
+        ascending: Sort direction.
+    Returns:
+        Sorted rows.
+    """
+    min_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+    def key(row: CronJobRow) -> Any:
+        mapping = {
+            "NAMESPACE": (row.namespace, row.name),
+            "NAME": (row.name, row.namespace),
+            "SCHEDULE": (row.schedule, row.namespace, row.name),
+            "TZ": (row.timezone, row.namespace, row.name),
+            "SUSP": (row.suspend, row.namespace, row.name),
+            "LAST": (row.last_schedule or min_time, row.namespace, row.name),
+            "NEXT": (row.next_schedule or min_time, row.namespace, row.name),
+            "LATE": (row.late_seconds, row.namespace, row.name),
+            "ACTIVE": (row.active, row.namespace, row.name),
+            "OK": (row.succeeded, row.namespace, row.name),
+            "FAIL": (row.failed, row.namespace, row.name),
+            "P50": (row.p50_s or -1.0, row.namespace, row.name),
+            "P95": (row.p95_s or -1.0, row.namespace, row.name),
+            "P99": (row.p99_s or -1.0, row.namespace, row.name),
+            "STATUS": (status_rank(row.status), row.namespace, row.name),
+            "HINT": (row.hint, row.namespace, row.name),
+        }
+        return mapping.get(column, (row.namespace, row.name))
+
+    return sorted(rows, key=key, reverse=not ascending)
+
+
 def match_text(needles: Sequence[str], query: str) -> bool:
     if not query:
         return True
     query = query.lower()
     return any(query in str(value).lower() for value in needles)
+
+
+def cronjob_filter_values(row: CronJobRow) -> List[str]:
+    """Return searchable CronJob row fields. / Возвращает searchable поля CronJob."""
+    return [
+        row.namespace,
+        row.name,
+        row.schedule,
+        row.timezone,
+        row.status,
+        row.hint,
+        row.latest_job,
+        row.latest_status,
+    ]
 
 
 def node_filter_values(node: NodeRow) -> List[str]:
@@ -3741,6 +4416,45 @@ def dump_pod_json(pod: PodRow, args: Optional[argparse.Namespace], include_raw: 
     return result
 
 
+def dump_cronjob_json(row: CronJobRow, include_raw: bool) -> Dict[str, Any]:
+    """Serialize a CronJob diagnostic row. / Сериализует строку диагностики CronJob.
+
+    Args:
+        row: CronJob diagnostic row.
+        include_raw: Whether to include the raw Kubernetes object.
+    Returns:
+        JSON-ready CronJob object.
+    """
+    result: Dict[str, Any] = {
+        "namespace": row.namespace,
+        "name": row.name,
+        "schedule": row.schedule,
+        "timezone": row.timezone,
+        "suspend": row.suspend,
+        "last_schedule": isoformat_utc(row.last_schedule),
+        "last_success": isoformat_utc(row.last_success),
+        "next_schedule": isoformat_utc(row.next_schedule),
+        "late_seconds": json_metric(row.late_seconds),
+        "active": row.active,
+        "succeeded": row.succeeded,
+        "failed": row.failed,
+        "duration_percentiles_seconds": {
+            "p50": json_metric(row.p50_s),
+            "p95": json_metric(row.p95_s),
+            "p99": json_metric(row.p99_s),
+        },
+        "latest_job": {"name": row.latest_job, "status": row.latest_status},
+        "status": row.status,
+        "severity": row.severity,
+        "hint": row.hint,
+        "suggestions": list(row.suggestions),
+        "parse_error": row.parse_error,
+    }
+    if include_raw:
+        result["raw"] = row.raw
+    return result
+
+
 def dump_snapshot_json(snapshot: ClusterSnapshot, args: Optional[argparse.Namespace] = None) -> str:
     """Render snapshot as stable JSON dump. / Рендерит snapshot как стабильный JSON dump.
 
@@ -3760,6 +4474,7 @@ def dump_snapshot_json(snapshot: ClusterSnapshot, args: Optional[argparse.Namesp
     net_tx = sum(node.net_tx_bps for node in snapshot.nodes)
     io_read = sum(node.fs_read_bps for node in snapshot.nodes)
     io_write = sum(node.fs_write_bps for node in snapshot.nodes)
+    cronjob_rows = sort_cronjobs(build_cronjob_rows(snapshot), "STATUS", True)
     payload = {
         "version": __VERSION__,
         "loaded_at": isoformat_utc(snapshot.loaded_at),
@@ -3798,6 +4513,7 @@ def dump_snapshot_json(snapshot: ClusterSnapshot, args: Optional[argparse.Namesp
         },
         "nodes": [dump_node_json(node, args, include_raw, snapshot.metrics_available) for node in sort_nodes(snapshot.nodes, "NAME", True)],
         "pods": [dump_pod_json(pod, args, include_raw, snapshot.metrics_available) for pod in selected_pods],
+        "cronjobs": [dump_cronjob_json(row, include_raw) for row in cronjob_rows],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
 
@@ -3921,6 +4637,36 @@ def dump_snapshot(snapshot: ClusterSnapshot, args: Optional[argparse.Namespace] 
                 format_bytes_per_sec(dump_metric_max(pod.io_history, pod.fs_read_bps + pod.fs_write_bps, args)),
             )
         )
+    cronjob_rows = sort_cronjobs(build_cronjob_rows(snapshot), "STATUS", True)
+    if cronjob_rows:
+        lines.append("")
+        lines.append("CronJobs:")
+        now = dt.datetime.now(dt.timezone.utc)
+        for row in cronjob_rows:
+            last_text = human_age(row.last_schedule, now)
+            if row.next_schedule and row.next_schedule > now:
+                next_text = "in %s" % format_duration_compact((row.next_schedule - now).total_seconds())
+            elif row.late_seconds:
+                next_text = "late %s" % format_duration_compact(row.late_seconds)
+            else:
+                next_text = "-"
+            lines.append(
+                "  %-12s %-32s %-12s schedule=%-14s last=%-8s next=%-10s active=%d ok=%d fail=%d p50=%s p95=%s hint=%s"
+                % (
+                    row.namespace,
+                    truncate(row.name, 32),
+                    row.status,
+                    truncate(row.schedule, 14),
+                    last_text,
+                    next_text,
+                    row.active,
+                    row.succeeded,
+                    row.failed,
+                    format_duration_compact(row.p50_s),
+                    format_duration_compact(row.p95_s),
+                    truncate(row.hint, 60),
+                )
+            )
     if snapshot.warnings:
         lines.append("")
         lines.append("Warnings:")
@@ -3945,7 +4691,7 @@ class KtopApp:
         self.client = client
         self.snapshot: Optional[ClusterSnapshot] = None
         self.page = "overview"
-        self.stack: List[Tuple[str, Optional[str], Optional[Tuple[str, str]], Optional[str]]] = []
+        self.stack: List[Tuple[str, Optional[str], Optional[Tuple[str, str]], Optional[str], Optional[Tuple[str, str]]]] = []
         self.overview_mode = "nodes"
         self.focus = "nodes"
         self.resource_focus = RESOURCE_PANEL_KEYS[0]
@@ -3953,6 +4699,7 @@ class KtopApp:
         self.node_sort = ("NAME", True)
         self.namespace_sort = ("NAMESPACE", True)
         self.pod_sort = ("NAMESPACE", True)
+        self.cronjob_sort = ("STATUS", True)
         self.selected = {
             "nodes": 0,
             "overview_namespaces": 0,
@@ -3960,6 +4707,8 @@ class KtopApp:
             "node_pods": 0,
             "namespace_pods": 0,
             "containers": 0,
+            "cronjobs": 0,
+            "cronjob_pods": 0,
             "namespaces": 0,
         }
         self.scroll = {
@@ -3969,6 +4718,8 @@ class KtopApp:
             "node_pods": 0,
             "namespace_pods": 0,
             "containers": 0,
+            "cronjobs": 0,
+            "cronjob_pods": 0,
             "logs": 0,
             "help": 0,
             "health": 0,
@@ -3991,6 +4742,8 @@ class KtopApp:
             "node_pods": 0,
             "namespace_pods": 0,
             "containers": 0,
+            "cronjobs": 0,
+            "cronjob_pods": 0,
             "health_runtime": 0,
             "health_workloads": 0,
             "health_resources": 0,
@@ -4004,6 +4757,7 @@ class KtopApp:
             "nodes": "",
             "overview_namespaces": "",
             "pods": "",
+            "cronjobs": "",
             "logs": "",
             "namespace_picker": "",
             "viewer": "",
@@ -4014,6 +4768,7 @@ class KtopApp:
         self.current_namespace: Optional[str] = None
         self.current_pod: Optional[Tuple[str, str]] = None
         self.current_container: Optional[str] = None
+        self.current_cronjob: Optional[Tuple[str, str]] = None
         self.message = ""
         self.message_until = 0.0
         self.pending_esc_at = 0.0
@@ -4181,6 +4936,10 @@ class KtopApp:
             self.draw_namespace_detail(content_y, 0, content_h, width)
         elif self.page == "pod":
             self.draw_pod_detail(content_y, 0, content_h, width)
+        elif self.page == "cronjobs":
+            self.draw_cronjobs(content_y, 0, content_h, width)
+        elif self.page == "cronjob":
+            self.draw_cronjob_detail(content_y, 0, content_h, width)
         elif self.page == "logs":
             self.draw_logs(content_y, 0, content_h, width)
         elif self.page == "viewer":
@@ -4691,6 +5450,26 @@ class KtopApp:
             focused=(self.page == "overview" and self.focus == "pods"),
         )
 
+    def draw_cronjobs(self, y: int, x: int, height: int, width: int) -> None:
+        """Draw CronJob diagnostics list. / Рисует список диагностики CronJob."""
+        rows = self.current_cronjobs()
+        title = "CronJobs (%d/%d)" % (len(rows), len(self.all_cronjob_rows()))
+        if self.filters["cronjobs"] or self.editing_filter == "cronjobs":
+            title += " filter:%s" % self.filter_display("cronjobs", "")
+        self.draw_table(
+            y,
+            x,
+            height,
+            width,
+            title,
+            CRONJOB_COLUMNS,
+            rows,
+            self.cronjob_cell,
+            "cronjobs",
+            self.cronjob_sort,
+            focused=self.page == "cronjobs",
+        )
+
     def draw_table(
         self,
         y: int,
@@ -4851,6 +5630,27 @@ class KtopApp:
                     "MEM": 18,
                 }
             )
+        if "SCHEDULE" in columns and "P95" in columns:
+            desired.update(
+                {
+                    "NAMESPACE": 16,
+                    "NAME": 34,
+                    "SCHEDULE": 14,
+                    "TZ": 12,
+                    "SUSP": 6,
+                    "LAST": 8,
+                    "NEXT": 8,
+                    "LATE": 8,
+                    "ACTIVE": 7,
+                    "OK": 5,
+                    "FAIL": 5,
+                    "P50": 8,
+                    "P95": 8,
+                    "P99": 8,
+                    "STATUS": 12,
+                    "HINT": 42,
+                }
+            )
         return {col: max(1, desired.get(col, 12)) for col in columns}
 
     def rate_mini_cell(self, key: Tuple[Any, ...], history: Sequence[float], current: float, width: int = 6) -> Tuple[str, Optional[int]]:
@@ -4947,6 +5747,56 @@ class KtopApp:
         if col == "IO":
             current = namespace.fs_read_bps + namespace.fs_write_bps
             return self.rate_mini_cell(history_key_namespace(namespace.name, "io"), namespace.io_history, current)
+        return "-", None
+
+    def cronjob_time_text(self, value: Optional[dt.datetime], late_seconds: float = 0.0) -> str:
+        """Format CronJob time in a table cell. / Форматирует время CronJob для таблицы."""
+        if not value:
+            return "-"
+        now = dt.datetime.now(dt.timezone.utc)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        if value > now:
+            return "in %s" % format_duration_compact((value - now).total_seconds())
+        if late_seconds > 0:
+            return "late %s" % format_duration_compact(late_seconds)
+        return human_age(value, now)
+
+    def cronjob_cell(self, row: CronJobRow, col: str) -> Tuple[str, Optional[int]]:
+        """Render one CronJob table cell. / Рендерит одну ячейку таблицы CronJob."""
+        attr = self.health_severity_attr(row.severity)
+        if col == "NAMESPACE":
+            return row.namespace, self.colors.get("yellow", 0)
+        if col == "NAME":
+            return row.name, self.colors.get("yellow", 0)
+        if col == "SCHEDULE":
+            return row.schedule, None
+        if col == "TZ":
+            return row.timezone, None
+        if col == "SUSP":
+            return "yes" if row.suspend else "no", self.colors.get("yellow", 0) if row.suspend else self.colors.get("green", 0)
+        if col == "LAST":
+            return self.cronjob_time_text(row.last_schedule), None
+        if col == "NEXT":
+            return self.cronjob_time_text(row.next_schedule, row.late_seconds), attr
+        if col == "LATE":
+            return format_duration_compact(row.late_seconds) if row.late_seconds else "-", attr if row.late_seconds else None
+        if col == "ACTIVE":
+            return str(row.active), self.colors.get("yellow", 0) if row.active else self.colors.get("green", 0)
+        if col == "OK":
+            return str(row.succeeded), self.colors.get("green", 0)
+        if col == "FAIL":
+            return str(row.failed), self.colors.get("red", 0) if row.failed else self.colors.get("green", 0)
+        if col == "P50":
+            return format_duration_compact(row.p50_s), None
+        if col == "P95":
+            return format_duration_compact(row.p95_s), None
+        if col == "P99":
+            return format_duration_compact(row.p99_s), None
+        if col == "STATUS":
+            return row.status, attr
+        if col == "HINT":
+            return row.hint, attr
         return "-", None
 
     def pod_cell(self, pod: PodRow, col: str) -> Tuple[str, Optional[int]]:
@@ -5595,6 +6445,107 @@ class KtopApp:
             return str(container.mounts), None
         return "-", None
 
+    def cronjob_info_rows(self, row: CronJobRow) -> List[Tuple[str, str, int]]:
+        """Build CronJob info rows. / Формирует строки Info для CronJob."""
+        return [
+            ("Status", row.status, self.health_severity_attr(row.severity)),
+            ("Schedule", row.schedule, 0),
+            ("Timezone", row.timezone, 0),
+            ("Suspended", "yes" if row.suspend else "no", self.colors.get("yellow", 0) if row.suspend else self.colors.get("green", 0)),
+            ("Last", self.cronjob_time_text(row.last_schedule), 0),
+            ("Next", self.cronjob_time_text(row.next_schedule, row.late_seconds), self.health_severity_attr(row.severity)),
+            ("LastSuccess", self.cronjob_time_text(row.last_success), self.colors.get("green", 0) if row.last_success else 0),
+            ("Hint", row.hint, self.health_severity_attr(row.severity)),
+        ]
+
+    def cronjob_sla_rows(self, row: CronJobRow) -> List[Tuple[str, str, int]]:
+        """Build CronJob SLA rows. / Формирует строки SLA для CronJob."""
+        return [
+            ("Active", str(row.active), self.colors.get("yellow", 0) if row.active else self.colors.get("green", 0)),
+            ("Succeeded", str(row.succeeded), self.colors.get("green", 0)),
+            ("Failed", str(row.failed), self.colors.get("red", 0) if row.failed else self.colors.get("green", 0)),
+            ("Late", format_duration_compact(row.late_seconds) if row.late_seconds else "-", self.health_severity_attr(row.severity) if row.late_seconds else 0),
+            ("P50", format_duration_compact(row.p50_s), 0),
+            ("P95", format_duration_compact(row.p95_s), 0),
+            ("P99", format_duration_compact(row.p99_s), 0),
+            ("LatestJob", row.latest_job, self.status_attr(row.latest_status)),
+            ("LatestState", row.latest_status, self.status_attr(row.latest_status)),
+        ]
+
+    def cronjob_context_rows(self, row: CronJobRow, max_rows: int) -> List[Tuple[str, str, int]]:
+        """Build suggestions/events/job context rows. / Формирует строки подсказок/events/job context."""
+        rows: List[Tuple[str, str, int]] = []
+        for suggestion in row.suggestions:
+            rows.append(("Suggest", suggestion, self.colors.get("yellow", 0)))
+        runs = self.cronjob_runs(row)
+        if runs:
+            rows.append(("", "Recent Jobs", self.colors.get("cyan", 0)))
+            for run in runs[:3]:
+                started = human_age(run.start_time)
+                duration = format_duration_compact(run.duration_s)
+                value = "%s status=%s dur=%s" % (truncate(run.name, 28), run.status, duration)
+                rows.append((started, value, self.status_attr(run.status)))
+        events = self.cronjob_events(row)
+        if events:
+            rows.append(("", "Events", self.colors.get("cyan", 0)))
+            for event in events[: max(1, max_rows - len(rows))]:
+                value = "%s %s" % (event.reason or event.event_type or "-", truncate(event.message, 70))
+                rows.append((human_age(event.timestamp), value, self.colors.get("yellow", 0) if event.event_type == "Warning" else 0))
+        return rows[:max_rows] or [("-", "No related events or suggestions.", self.colors.get("green", 0))]
+
+    def draw_cronjob_detail(self, y: int, x: int, height: int, width: int) -> None:
+        """Draw CronJob detail screen. / Рисует экран деталей CronJob."""
+        row = self.find_cronjob(self.current_cronjob)
+        if not row:
+            self.box(y, x, height, width, "CronJob Detail", focused=False)
+            self.add(y + 2, x + 2, "CronJob not found", self.colors.get("red", 0))
+            return
+        related_pods = self.cronjob_related_pods(row)
+        if height < 18:
+            self.box(y, x, height, width, "CronJobs > %s" % row.name, focused=True)
+            lines = [
+                "Status: %s | Schedule: %s | Last: %s | Next: %s"
+                % (row.status, row.schedule, self.cronjob_time_text(row.last_schedule), self.cronjob_time_text(row.next_schedule, row.late_seconds)),
+                "SLA: active=%d ok=%d fail=%d p50=%s p95=%s p99=%s"
+                % (row.active, row.succeeded, row.failed, format_duration_compact(row.p50_s), format_duration_compact(row.p95_s), format_duration_compact(row.p99_s)),
+                "Hint: %s" % row.hint,
+            ]
+            for idx, line in enumerate(lines[: max(0, height - 2)]):
+                self.add(y + 1 + idx, x + 2, line, self.health_severity_attr(row.severity), width - 4)
+            return
+
+        self.box(y, x, height, width, "CronJobs > %s" % row.name, focused=True)
+        inner_x = x + 1
+        inner_w = width - 2
+        detail_h = min(13, max(9, height // 3))
+        table_y = y + detail_h
+        table_h = max(6, y + height - table_y - 1)
+        self.box(y + 1, inner_x, detail_h - 1, inner_w, "Info / SLA / Context", focused=False)
+        col_w = max(24, (inner_w - 4) // 3)
+        info_x = inner_x + 2
+        sla_x = info_x + col_w
+        context_x = sla_x + col_w
+        context_w = max(1, inner_x + inner_w - 2 - context_x)
+        self.add(y + 2, info_x, "Info", self.colors.get("cyan", 0), col_w - 1)
+        self.draw_detail_rows(y + 3, info_x, detail_h - 4, col_w - 1, self.cronjob_info_rows(row))
+        self.add(y + 2, sla_x, "SLA", self.colors.get("cyan", 0), col_w - 1)
+        self.draw_detail_rows(y + 3, sla_x, detail_h - 4, col_w - 1, self.cronjob_sla_rows(row))
+        self.add(y + 2, context_x, "Context", self.colors.get("cyan", 0), context_w)
+        self.draw_detail_rows(y + 3, context_x, detail_h - 4, context_w, self.cronjob_context_rows(row, detail_h - 4))
+        self.draw_table(
+            table_y,
+            inner_x,
+            table_h,
+            inner_w,
+            "Related Pods (%d) - Enter: pod detail" % len(related_pods),
+            ["NAMESPACE", "POD", "STATUS", "READY", "RST", "AGE", "NODE", "CPU", "MEMORY"],
+            related_pods,
+            self.pod_cell,
+            "cronjob_pods",
+            self.pod_sort,
+            focused=True,
+        )
+
     def draw_events(self, y: int, x: int, height: int, width: int, title: str, events: Sequence[EventInfo]) -> None:
         if height < 4 or width < 20:
             return
@@ -5674,6 +6625,26 @@ class KtopApp:
                     )
                 )
 
+        cronjob_findings: List[Tuple[str, str]] = []
+        for row in build_cronjob_rows(snap):
+            if row.severity != "ok":
+                cronjob_findings.append(
+                    (
+                        "%-5s %-14s %-44s status=%s next=%s late=%s p95=%s hint=%s"
+                        % (
+                            "CRON",
+                            truncate(row.namespace, 14),
+                            truncate(row.name, 44),
+                            row.status,
+                            isoformat_utc(row.next_schedule) or "-",
+                            format_duration_compact(row.late_seconds) if row.late_seconds else "-",
+                            format_duration_compact(row.p95_s),
+                            truncate(row.hint, 80),
+                        ),
+                        row.severity,
+                    )
+                )
+
         event_findings: List[Tuple[str, str]] = []
         warning_events = [event for event in snap.events if event.event_type == "Warning"]
         for event in warning_events:
@@ -5691,6 +6662,7 @@ class KtopApp:
             node_findings=node_findings,
             pod_findings=pod_findings,
             workload_findings=workload_findings,
+            cronjob_findings=cronjob_findings,
             event_findings=event_findings,
             collection_warnings=collection_warnings,
             resource_findings=resource_findings,
@@ -6098,13 +7070,14 @@ class KtopApp:
         append_section("Nodes", data.node_findings, 50)
         append_section("Pods", data.pod_findings, 50)
         append_section("Workloads", data.workload_findings, 40)
+        append_section("CronJobs", data.cronjob_findings, 40)
         append_section("Warning Events", data.event_findings, 30)
         append_section("Resource Pressure", data.resource_findings, 50)
         append_section("Scheduling Fit", data.scheduling_findings, 50)
         append_section("Collection Warnings", data.collection_warnings, 20)
         resource_problems = [row for row in data.resource_findings if row[1] != "ok"]
         scheduling_problems = [row for row in data.scheduling_findings if row[1] != "ok"]
-        if not any((data.node_findings, data.pod_findings, data.workload_findings, data.event_findings, resource_problems, scheduling_problems, data.collection_warnings)):
+        if not any((data.node_findings, data.pod_findings, data.workload_findings, data.cronjob_findings, data.event_findings, resource_problems, scheduling_problems, data.collection_warnings)):
             lines.append("No obvious problems found in loaded snapshot.")
         return lines
 
@@ -6178,7 +7151,7 @@ class KtopApp:
     def health_workload_panel_rows(self, data: HealthData) -> Tuple[str, List[Tuple[str, str]], str]:
         """Build workload and event health panel rows. / Формирует строки панели workloads/events."""
         header = "%-5s %-14s %-44s %s" % ("KIND", "NAMESPACE/AGE", "NAME/WHERE", "STATUS / MESSAGE")
-        return header, data.workload_findings + data.event_findings, "No workload or warning event findings."
+        return header, data.workload_findings + data.cronjob_findings + data.event_findings, "No workload, CronJob, or warning event findings."
 
     def health_resource_panel_rows(self, data: HealthData) -> Tuple[str, List[Tuple[str, str]], str]:
         """Build resource pressure health panel rows. / Формирует строки панели resource pressure."""
@@ -6217,7 +7190,7 @@ class KtopApp:
         self.add(y + 1, inner_x + 1, "Loaded: %s | Metrics: %s" % (data.loaded_at, data.metrics_status), self.colors.get("yellow", 0), inner_w - 2)
 
         runtime_count = len(data.node_findings) + len(data.pod_findings)
-        workload_count = len(data.workload_findings) + len(data.event_findings)
+        workload_count = len(data.workload_findings) + len(data.cronjob_findings) + len(data.event_findings)
         warnings_count = len(data.event_findings) + len(data.collection_warnings)
         resource_problem_count = len([row for row in data.resource_findings if row[1] != "ok"])
         scheduling_problem_count = len([row for row in data.scheduling_findings if row[1] != "ok"])
@@ -6227,7 +7200,7 @@ class KtopApp:
         card_w = max(12, (inner_w - 3 * gap) // 4)
         cards = [
             ("Runtime", "nodes: %d\npods: %d" % (len(data.node_findings), len(data.pod_findings)), "", self.resource_risk_attr(runtime_count)),
-            ("Workloads", "items: %d\nevents: %d" % (len(data.workload_findings), len(data.event_findings)), "", self.resource_risk_attr(workload_count)),
+            ("Workloads", "items: %d\ncron: %d" % (len(data.workload_findings), len(data.cronjob_findings)), "", self.resource_risk_attr(workload_count)),
             ("Resources", "pressure: %d\nsched: %d" % (resource_problem_count, scheduling_problem_count), "", self.resource_risk_attr(resource_problem_count + scheduling_problem_count)),
             ("Warnings", "events: %d\ncollect: %d" % (len(data.event_findings), len(data.collection_warnings)), "", self.resource_risk_attr(warnings_count)),
         ]
@@ -6824,15 +7797,21 @@ class KtopApp:
         return getattr(self, "filters", {}).get(key, "")
 
     def query_error(self, query: str) -> str:
-        """Validate a regex query for search fallback. / Проверяет regex query для fallback.
+        """Validate a safe regex query for search fallback. / Проверяет безопасный regex query.
 
         Args:
             query: User-entered search expression.
         Returns:
-            Empty string for a valid regex; otherwise the regex error text.
+            Empty string for a usable regex; otherwise a fallback reason.
         """
         if not query:
             return ""
+        if len(query) > MAX_SEARCH_REGEX_LENGTH:
+            return "regex too long (%d > %d)" % (len(query), MAX_SEARCH_REGEX_LENGTH)
+        if _REGEX_NESTED_REPEAT_RE.search(query):
+            return "potentially expensive nested repeat"
+        if _REGEX_REPEATED_ALT_RE.search(query):
+            return "potentially expensive repeated alternation"
         try:
             re.compile(query, re.IGNORECASE)
         except re.error as exc:
@@ -6856,9 +7835,10 @@ class KtopApp:
         wrapped: List[str] = []
         wrap_width = max(20, width)
         for line in source:
+            safe_line = sanitize_terminal_text(line)
             wrapped.extend(
                 textwrap.wrap(
-                    line,
+                    safe_line,
                     wrap_width,
                     replace_whitespace=not preserve_whitespace,
                     drop_whitespace=not preserve_whitespace,
@@ -6904,7 +7884,8 @@ class KtopApp:
         """Return line indexes containing search matches. / Возвращает индексы строк с совпадениями."""
         if not query:
             return []
-        return [idx for idx, line in enumerate(lines) if self.query_match_spans(line, query, filter_error)]
+        effective_error = filter_error or self.query_error(query)
+        return [idx for idx, line in enumerate(lines) if self.query_match_spans(line, query, effective_error)]
 
     def sync_search_query(self, key: str, query: str) -> None:
         """Reset match position when the query changes. / Сбрасывает позицию совпадения при смене query.
@@ -7031,7 +8012,7 @@ class KtopApp:
             self.scroll["logs"] = max(0, len(lines) - area_h)
         scroll = self.adjust_scroll("logs", self.scroll.get("logs", 0), area_h, len(lines), selection_is_scroll=True)
         if self.log_filter_error:
-            self.add(y + 2, x + 2, "Invalid regex, substring fallback: %s" % truncate(self.log_filter_error, width - 40), self.colors.get("red", 0), width - 4)
+            self.add(y + 2, x + 2, "Regex fallback to substring: %s" % truncate(self.log_filter_error, width - 36), self.colors.get("red", 0), width - 4)
         for idx, line in enumerate(lines[scroll : scroll + area_h]):
             self.add_highlighted(y + 3 + idx, x + 2, line, query, width - 4, self.log_filter_error)
         if len(lines) > area_h and area_h > 0:
@@ -7088,7 +8069,7 @@ class KtopApp:
             self.ensure_search_visible("viewer", lines, area_h, self.viewer_filter_error)
         scroll = self.adjust_scroll("viewer", self.scroll.get("viewer", 0), area_h, len(lines), selection_is_scroll=True)
         if self.viewer_filter_error:
-            self.add(y + 2, x + 2, "Invalid regex, substring fallback: %s" % truncate(self.viewer_filter_error, width - 40), self.colors.get("red", 0), width - 4)
+            self.add(y + 2, x + 2, "Regex fallback to substring: %s" % truncate(self.viewer_filter_error, width - 36), self.colors.get("red", 0), width - 4)
         for idx, line in enumerate(lines[scroll : scroll + area_h]):
             self.add_highlighted(y + 3 + idx, x + 2, line, query, width - 4, self.viewer_filter_error)
         if len(lines) > area_h and area_h > 0:
@@ -7145,13 +8126,17 @@ class KtopApp:
         if height > 1 and self.message and time.time() < self.message_until:
             self.add(y, x, truncate(self.message, width).ljust(width), self.colors.get("red", 0) if self.message.startswith("ERROR:") else self.colors.get("yellow", 0), width)
         if self.page == "overview":
-            text = "Tab focus | ←/→ columns | g nodes/namespaces | h health | z resources | d/y view | 2 namespace | / filter | ESC/q"
+            text = "Tab focus | ←/→ columns | g nodes/namespaces | j cronjobs | h health | z resources | d/y view | 2 namespace | / filter | ESC/q"
         elif self.page == "node":
             text = "↑/↓ select pod | ←/→ columns | d describe | y yaml | Enter pod detail | ESC back | r/u refresh | ? help"
         elif self.page == "namespace":
             text = "↑/↓ select pod | ←/→ columns | d describe | y yaml | Enter pod detail | / filter pods | ESC back | r/u refresh"
         elif self.page == "pod":
             text = "↑/↓ select container | ←/→ columns | d describe | y yaml | Enter/l logs | o owner | n node | ESC back | r/u refresh"
+        elif self.page == "cronjobs":
+            text = "↑/↓ select CronJob | ←/→ columns | Enter detail | d describe | y yaml | / filter | r/u refresh | ESC"
+        elif self.page == "cronjob":
+            text = "↑/↓ select related pod | ←/→ columns | Enter pod detail | d describe | y yaml | ESC back | r/u refresh"
         elif self.page == "logs":
             text = "d/y view | s stream | p previous(no search) | n/p matches | c/[/] container | t timestamps | w wrap | f plain | / search | ESC"
         elif self.page == "viewer":
@@ -7258,6 +8243,67 @@ class KtopApp:
         pods = [pod for pod in self.snapshot.pods if pod.namespace == namespace and match_text(pod_filter_values(pod), self.filters["pods"])]
         return sort_pods(pods, self.pod_sort[0], self.pod_sort[1])
 
+    def all_cronjob_rows(self) -> List[CronJobRow]:
+        """Return all CronJob diagnostic rows. / Возвращает все строки диагностики CronJob."""
+        if not self.snapshot:
+            return []
+        return build_cronjob_rows(self.snapshot)
+
+    def current_cronjobs(self) -> List[CronJobRow]:
+        """Return filtered and sorted CronJob rows. / Возвращает filtered/sorted CronJob rows."""
+        rows = [row for row in self.all_cronjob_rows() if match_text(cronjob_filter_values(row), self.filters["cronjobs"])]
+        return sort_cronjobs(rows, self.cronjob_sort[0], self.cronjob_sort[1])
+
+    def cronjob_runs(self, row: CronJobRow) -> List[CronJobRunRow]:
+        """Return Job runs for one CronJob. / Возвращает Job-запуски одного CronJob."""
+        if not self.snapshot:
+            return []
+        runs = []
+        for workload in self.snapshot.workloads.values():
+            run = job_run_from_workload(workload)
+            if run and run.namespace == row.namespace and run.cronjob == row.name:
+                runs.append(run)
+        runs.sort(key=lambda item: item.start_time or item.completion_time or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
+        return runs
+
+    def find_cronjob(self, key: Optional[Tuple[str, str]]) -> Optional[CronJobRow]:
+        """Find a CronJob diagnostic row by namespace/name. / Ищет CronJob по namespace/name."""
+        if not key:
+            return None
+        namespace, name = key
+        for row in self.all_cronjob_rows():
+            if row.namespace == namespace and row.name == name:
+                return row
+        return None
+
+    def cronjob_related_pods(self, row: CronJobRow) -> List[PodRow]:
+        """Return pods owned by a CronJob or its Jobs. / Возвращает pod'ы CronJob или его Job."""
+        if not self.snapshot:
+            return []
+        job_names = {run.name for run in self.cronjob_runs(row)}
+        related = []
+        for pod in self.snapshot.pods:
+            if pod.namespace != row.namespace:
+                continue
+            chain = pod.owner_chain or pod.owners
+            if ("CronJob", row.name) in chain or any(kind == "Job" and name in job_names for kind, name in chain):
+                related.append(pod)
+        return sort_pods(related, self.pod_sort[0], self.pod_sort[1])
+
+    def cronjob_events(self, row: CronJobRow) -> List[EventInfo]:
+        """Return events related to a CronJob, its Jobs, or its pods. / Возвращает связанные events."""
+        if not self.snapshot:
+            return []
+        job_names = {run.name for run in self.cronjob_runs(row)}
+        pod_names = {pod.name for pod in self.cronjob_related_pods(row)}
+        related = []
+        for event in self.snapshot.events:
+            if event.namespace != row.namespace:
+                continue
+            if (event.kind == "CronJob" and event.name == row.name) or (event.kind == "Job" and event.name in job_names) or (event.kind == "Pod" and event.name in pod_names):
+                related.append(event)
+        return related
+
     def find_node(self, name: Optional[str]) -> Optional[NodeRow]:
         if not self.snapshot or not name:
             return None
@@ -7339,6 +8385,15 @@ class KtopApp:
                 return ObjectTarget(kind, pod.namespace, name, "%s/%s/%s" % (kind, pod.namespace, name))
             if pod:
                 return ObjectTarget("pod", pod.namespace, pod.name, "Pod/%s/%s" % (pod.namespace, pod.name))
+        elif self.page == "cronjobs":
+            rows = self.current_cronjobs()
+            if rows:
+                row = rows[min(self.selected.get("cronjobs", 0), len(rows) - 1)]
+                return ObjectTarget("cronjob", row.namespace, row.name, "CronJob/%s/%s" % (row.namespace, row.name))
+        elif self.page == "cronjob":
+            row = self.find_cronjob(self.current_cronjob)
+            if row:
+                return ObjectTarget("cronjob", row.namespace, row.name, "CronJob/%s/%s" % (row.namespace, row.name))
         elif self.page == "namespaces":
             rows = self.namespace_rows()
             if rows:
@@ -7436,6 +8491,9 @@ class KtopApp:
         if key == "2":
             self.open_namespace_picker()
             return False
+        if key == "j" and self.page != "cronjobs":
+            self.push_page("cronjobs")
+            return False
         if key == "!" or key == "h":
             self.push_page("health")
             return False
@@ -7464,6 +8522,8 @@ class KtopApp:
         if self.page == "overview" and self.handle_overview_char(ch):
             return False
         if self.page == "overview":
+            return False
+        if self.page == "cronjobs" and self.handle_cronjobs_char(ch):
             return False
         if self.page == "pod" and key == "n":
             pod = self.find_pod(self.current_pod)
@@ -7597,6 +8657,12 @@ class KtopApp:
             pod = self.find_pod(self.current_pod)
             count = len(pod.containers) if pod else 0
             self.move_selected("containers", ch, amount, count)
+        elif self.page == "cronjobs":
+            self.move_selected("cronjobs", ch, amount, len(self.current_cronjobs()))
+        elif self.page == "cronjob":
+            row = self.find_cronjob(self.current_cronjob)
+            count = len(self.cronjob_related_pods(row)) if row else 0
+            self.move_selected("cronjob_pods", ch, amount, count)
         elif self.page == "logs":
             lines = self.filtered_log_lines(self.stdscr.getmaxyx()[1] - 4)
             self.log_autoscroll = ch == curses.KEY_END
@@ -7697,6 +8763,10 @@ class KtopApp:
             return "namespace_pods"
         if self.page == "pod":
             return "containers"
+        if self.page == "cronjobs":
+            return "cronjobs"
+        if self.page == "cronjob":
+            return "cronjob_pods"
         if self.page == "resources":
             return self.resource_focus
         if self.page == "health":
@@ -7744,6 +8814,17 @@ class KtopApp:
                 container = pod.containers[min(self.selected["containers"], len(pod.containers) - 1)]
                 self.push_page("logs", container_name=container.name)
                 self.load_logs()
+        elif self.page == "cronjobs":
+            rows = self.current_cronjobs()
+            if rows:
+                row = rows[min(self.selected["cronjobs"], len(rows) - 1)]
+                self.push_page("cronjob", cronjob_key=(row.namespace, row.name))
+        elif self.page == "cronjob":
+            row = self.find_cronjob(self.current_cronjob)
+            rows = self.cronjob_related_pods(row) if row else []
+            if rows:
+                pod = rows[min(self.selected["cronjob_pods"], len(rows) - 1)]
+                self.push_page("pod", pod_key=(pod.namespace, pod.name))
         elif self.page == "namespaces":
             self.choose_namespace()
 
@@ -7770,6 +8851,16 @@ class KtopApp:
                 self.pod_sort = (column, not self.pod_sort[1]) if self.pod_sort[0] == column else (column, True)
                 self.selected["pods"] = 0
                 return True
+        return False
+
+    def handle_cronjobs_char(self, ch: Any) -> bool:
+        """Handle CronJob list hotkeys. / Обрабатывает hotkeys списка CronJob."""
+        key = hotkey(ch)
+        if key in CRONJOB_SORT_KEYS:
+            column = CRONJOB_SORT_KEYS[key]
+            self.cronjob_sort = (column, not self.cronjob_sort[1]) if self.cronjob_sort[0] == column else (column, True)
+            self.selected["cronjobs"] = 0
+            return True
         return False
 
     def toggle_overview_mode(self) -> None:
@@ -7866,6 +8957,8 @@ class KtopApp:
                 key = "pods"
         elif self.page == "namespace":
             key = "pods"
+        elif self.page == "cronjobs":
+            key = "cronjobs"
         elif self.page == "logs":
             key = "logs"
         elif self.page == "viewer":
@@ -7891,6 +8984,7 @@ class KtopApp:
         node_name: Optional[str] = None,
         namespace_name: Optional[str] = None,
         pod_key: Optional[Tuple[str, str]] = None,
+        cronjob_key: Optional[Tuple[str, str]] = None,
         container_name: Optional[str] = None,
     ) -> None:
         """Push a new page onto navigation stack. / Открывает страницу через navigation stack.
@@ -7900,9 +8994,10 @@ class KtopApp:
             node_name: Optional current node.
             namespace_name: Optional current namespace.
             pod_key: Optional current pod key.
+            cronjob_key: Optional current CronJob key.
             container_name: Optional current container.
         """
-        self.stack.append((self.page, self.current_node, self.current_pod, self.current_container))
+        self.stack.append((self.page, self.current_node, self.current_pod, self.current_container, self.current_cronjob))
         self.page = page
         if node_name:
             self.current_node = node_name
@@ -7910,10 +9005,18 @@ class KtopApp:
             self.current_namespace = namespace_name
         if pod_key:
             self.current_pod = pod_key
+        if cronjob_key:
+            self.current_cronjob = cronjob_key
         if container_name:
             self.current_container = container_name
         if page == "logs":
             self.scroll["logs"] = 0
+        elif page == "cronjobs":
+            self.scroll["cronjobs"] = 0
+            self.hscroll["cronjobs"] = 0
+        elif page == "cronjob":
+            self.scroll["cronjob_pods"] = 0
+            self.hscroll["cronjob_pods"] = 0
         elif page == "health":
             self.scroll["health"] = 0
             self.health_focus = HEALTH_PANEL_KEYS[0]
@@ -7931,7 +9034,7 @@ class KtopApp:
 
     def pop_page(self) -> None:
         if self.stack:
-            self.page, self.current_node, self.current_pod, self.current_container = self.stack.pop()
+            self.page, self.current_node, self.current_pod, self.current_container, self.current_cronjob = self.stack.pop()
         else:
             self.page = "overview"
 
@@ -8019,11 +9122,11 @@ class KtopApp:
         return current
 
     def status_attr(self, status: str) -> int:
-        if status in ("Active", "Ready", "Running", "Completed", "True"):
+        if status in ("OK", "Active", "Ready", "Running", "Completed", "Complete", "True"):
             return self.colors.get("green", 0)
-        if status in ("Pending", "NotReady", "Terminating", "ContainerCreating", "Waiting"):
+        if status in ("Pending", "NotReady", "Terminating", "ContainerCreating", "Waiting", "Suspended", "Slow", "LongRunning"):
             return self.colors.get("yellow", 0)
-        if status in ("Failed", "Error", "CrashLoopBackOff", "Unknown", "False"):
+        if status in ("Failed", "Missed", "Error", "CrashLoopBackOff", "Unknown", "False"):
             return self.colors.get("red", 0)
         return 0
 
@@ -8220,6 +9323,7 @@ def help_lines() -> List[str]:
         "  Tab / Shift-Tab   cycle focus between primary table and pods",
         "  Left / Right      scroll focused table horizontally",
         "  g                 toggle primary table: nodes / namespaces",
+        "  j                 open CronJob diagnostics",
         "  2                 choose namespace from a list",
         "  /                 edit row filter in the focused table",
         "  Enter             drill down into selected node, namespace, or pod",
@@ -8232,6 +9336,13 @@ def help_lines() -> List[str]:
         "  n/s/p/a/r/f/c/m/e/o sort namespace table by visible column letters",
         "  n/p/r/s/t/a/v/i/o/c/m sort pod table by visible column letters",
         "  ESC ESC or q      quit",
+        "",
+        "CronJobs:",
+        "  j                 open CronJob list from any page",
+        "  /                 filter CronJobs by namespace/name/status/hint",
+        "  Enter             open CronJob detail with SLA, jobs, events, and related pods",
+        "  d / y             describe / YAML for selected CronJob",
+        "  n/j/s/l/x/a/o/f/p sort CronJob table by visible column letters",
         "",
         "Details:",
         "  ESC               go back",
@@ -8421,9 +9532,19 @@ def run_self_test() -> int:
     assert parse_duration_seconds("1500ms") == 1.5
     assert parse_duration_seconds("2m") == 120.0
     assert parse_duration_seconds("1h") == 3600.0
+    assert sanitize_terminal_text("a\x1bb\r\nc\t\x7f\x85") == "a^[b^M c ^?\\x85"
+    assert truncate("a\x1bb", 10) == "a^[b"
     assert len(render_sparkline([1, 2, 3], 6)) == 6
     assert render_sparkline([5, 5, 5], 4) == SPARKLINE_LEVELS[0] * 4
     assert aggregate_histories([[1.0, 2.0, 3.0], [10.0]]) == [1.0, 2.0, 13.0]
+    cron_reference = dt.datetime(2026, 6, 14, 12, 7, tzinfo=dt.timezone.utc)
+    cron_next, cron_warning = cron_next_after("*/15 * * * *", cron_reference, "UTC")
+    assert cron_warning == ""
+    assert cron_next == dt.datetime(2026, 6, 14, 12, 15, tzinfo=dt.timezone.utc)
+    assert cron_next_after("0/15 * * * *", cron_reference, "UTC")[0] == dt.datetime(2026, 6, 14, 12, 15, tzinfo=dt.timezone.utc)
+    assert parse_cron_schedule("@hourly").minutes == {0}
+    assert percentile([180.0, 120.0], 50.0) == 120.0
+    assert percentile([180.0, 120.0], 95.0) == 180.0
     chart_app = object.__new__(KtopApp)
     chart_app.rate_chart_peaks = {}
     assert chart_app.chart_values([5.0], 5.0, 4) == [0.0, 0.0, 0.0, 5.0]
@@ -8640,6 +9761,21 @@ def run_self_test() -> int:
     assert len(snapshot.pods) >= 5
     assert snapshot.deployments_ready == 3
     assert snapshot.namespaces == ["default", "kube-system", "monitoring", "storage"]
+    cron_rows = build_cronjob_rows(snapshot)
+    assert len(cron_rows) == 1
+    assert cron_rows[0].name == "nightly-backup"
+    assert cron_rows[0].status in ("OK", "Active")
+    assert cron_rows[0].succeeded == 2
+    assert cron_rows[0].p50_s == 120.0
+    cron_app = object.__new__(KtopApp)
+    cron_app.snapshot = snapshot
+    cron_app.filters = {"cronjobs": ""}
+    cron_app.cronjob_sort = ("STATUS", True)
+    cron_app.pod_sort = ("NAMESPACE", True)
+    assert cron_app.current_cronjobs()[0].name == "nightly-backup"
+    cron_app.current_cronjob = ("default", "nightly-backup")
+    assert cron_app.find_cronjob(cron_app.current_cronjob).name == "nightly-backup"
+    assert cron_app.cronjob_related_pods(cron_rows[0])[0].name == "nightly-backup-001-pod"
     namespace_app = object.__new__(KtopApp)
     namespace_app.snapshot = snapshot
     namespace_app.namespace_sort = ("NAMESPACE", True)
@@ -8673,6 +9809,8 @@ def run_self_test() -> int:
     assert dump_payload["dump"]["pod_count"] == 1
     assert dump_payload["dump"]["pod_total"] == len(snapshot.pods)
     assert dump_payload["pods"][0]["namespace"] == "default"
+    assert dump_payload["cronjobs"][0]["name"] == "nightly-backup"
+    assert dump_payload["cronjobs"][0]["duration_percentiles_seconds"]["p95"] == 180
     assert "max" in dump_payload["nodes"][0]["usage"]["cpu_m"]
     assert "containers" in dump_payload["pods"][0]
     namespace_dump_args = normalize_display_scope(build_arg_parser().parse_args(["--demo", "-n", "kube-system", "--dump", "--output", "json"]))
@@ -8737,6 +9875,9 @@ def run_self_test() -> int:
     assert log_app.search_match_lines(log_app.filtered_log_lines(20), "alpha", log_app.log_filter_error) == [0]
     assert log_app.query_match_spans("alpha alpha", "alpha") == [(0, 5), (6, 11)]
     assert log_app.query_match_spans("use [literal]", "[", "unterminated character set") == [(4, 5)]
+    assert log_app.query_error("(a+)+$") == "potentially expensive nested repeat"
+    assert log_app.search_match_lines(["literal (a+)+$ pattern"], "(a+)+$") == [0]
+    assert log_app.query_error("x" * (MAX_SEARCH_REGEX_LENGTH + 1)).startswith("regex too long")
 
     viewer_screen = FakeScreen(cols=40)
     viewer_app.stdscr = viewer_screen

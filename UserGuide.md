@@ -118,6 +118,10 @@ The pods table follows the selected namespace filter. If no namespace filter is 
 | `Home` / `End` | Jump to the first or last row |
 | `Left` / `Right` | Horizontally scroll the focused table |
 | `Enter` | Open the selected row |
+| `j` | Open CronJob diagnostics |
+| `h` / `!` | Open Problems / Health |
+| `z` | Open Resource Risk |
+| `x` | Open Metrics / RBAC diagnostics |
 | `Esc` | Go back, clear active filter, or confirm quit from overview |
 | `q` | Quit |
 | `?` | Open the help page |
@@ -198,6 +202,20 @@ Pod sort keys:
 | `c` | CPU |
 | `m` | MEMORY |
 
+CronJob sort keys:
+
+| Key | Column |
+| --- | ------ |
+| `n` | NAMESPACE |
+| `j` | NAME |
+| `s` | STATUS |
+| `l` | LAST |
+| `x` | NEXT |
+| `a` | ACTIVE |
+| `o` | OK |
+| `f` | FAIL |
+| `p` | P95 |
+
 `d` is reserved for describe, so node Disk sorting uses `k`.
 
 ## Detail Screens
@@ -262,6 +280,54 @@ The owner view follows ownerReferences such as:
 
 It shows desired/ready/updated/available counts, strategy or schedule, selectors, parent owner, controlled pods, and related events.
 
+## CronJob Diagnostics
+
+Press `j` from any page to open the CronJob diagnostics list.
+
+This page is a read-only operational view built from the Kubernetes objects already loaded by `ktop-py.py`: `CronJob`, `Job`, related `Pod`, and `Event` objects. It does not install a controller, CRD, webhook, database, or alert channel.
+
+The table columns are:
+
+| Column | Meaning |
+| ------ | ------- |
+| NAMESPACE / NAME | CronJob identity |
+| SCHEDULE / TZ | `spec.schedule` and `spec.timeZone`; non-UTC time zones are approximated as local time on Python 3.8 |
+| SUSP | Whether `spec.suspend` is true |
+| LAST | Age of `status.lastScheduleTime` |
+| NEXT | Next expected schedule, or how late it is |
+| LATE | Dead-man delay beyond the expected next schedule |
+| ACTIVE | Count of active Jobs reported by the CronJob status |
+| OK / FAIL | Completed and failed Job counts visible in the current snapshot |
+| P50 / P95 / P99 | Duration percentiles calculated from visible completed Jobs |
+| STATUS | `OK`, `Active`, `Suspended`, `Missed`, `Failed`, `LongRunning`, `Slow`, or `Unknown` |
+| HINT | Short reason or next check |
+
+Dead-man logic uses `status.lastScheduleTime` when available; otherwise it uses the CronJob creation time. `ktop-py.py` calculates the next schedule after that reference. If that next expected time is in the past by more than `startingDeadlineSeconds`, or by more than 300 seconds when no deadline is set, the CronJob is marked `Missed`.
+
+SLA duration logic is intentionally local to the loaded snapshot. P50/P95/P99 are calculated from Jobs that still exist under the CronJob history limits. If successful Job history is small, percentiles are useful as a quick hint, not as long-term SLO evidence.
+
+Status rules:
+
+| Status | Trigger |
+| ------ | ------- |
+| `Suspended` | `spec.suspend` is true |
+| `Unknown` | Schedule cannot be parsed with standard five-field cron syntax |
+| `Missed` | Expected next run is late past the deadline/grace window |
+| `Failed` | Latest visible Job failed |
+| `LongRunning` | Latest active Job is much longer than historical P95 |
+| `Slow` | Latest completed Job is much longer than historical P95 |
+| `Active` | CronJob has active Jobs and no warning condition was found |
+| `OK` | No warning condition was found |
+
+Press `Enter` on a CronJob row to open its detail page. The detail page shows:
+
+- Info: status, schedule, timezone, suspension state, last/next schedule, last success, and hint.
+- SLA: active/succeeded/failed counts, late time, P50/P95/P99, latest Job name and status.
+- Context: suggestions, recent Jobs, and related events.
+- Related Pods: pods owned by visible Jobs of the CronJob; press `Enter` on a pod to open Pod Detail and then logs.
+
+CronJob findings also appear on Problems / Health under the Workloads / Events panel. JSON dump output contains a top-level `cronjobs` array with the same status, timing, percentile, latest Job, severity, and suggestion fields.
+
 ## Describe and YAML Viewer
 
 Press:
@@ -324,7 +390,7 @@ The panels are:
 | Panel | Contents |
 | ----- | -------- |
 | Runtime | NotReady, pressured, cordoned, or tainted nodes; unhealthy pods; pods with readiness problems or high restart counts |
-| Workloads / Events | Workloads that are not ready and Kubernetes Warning events |
+| Workloads / Events | Workloads that are not ready, CronJob findings, and Kubernetes Warning events |
 | Resource Pressure / Collection | resource pressure signals, ResourceQuota usage, LimitRange policies, scheduler-fit findings, and collection warnings |
 
 The summary cards above the panels show counts of currently visible findings: runtime problems, workload/event problems, resource pressure rows, scheduler-fit rows, and collection warnings. Green means none, yellow means warning-level findings exist, and red means critical findings exist or the count is high enough to deserve immediate attention.
@@ -493,7 +559,7 @@ Each refresh loads a read-only snapshot through `kubectl`. For the richest view,
 - `persistentvolumes`, `persistentvolumeclaims`,
 - `resourcequotas`, `limitranges`.
 
-If access to optional objects is denied, `ktop-py.py` keeps running and records a collection warning. The affected panels may be incomplete. For example, without `resourcequotas` access, Health cannot show real namespace quota `used/hard` values; without `limitranges` access, it cannot show namespace default request/limit policies.
+If access to optional objects is denied, `ktop-py.py` keeps running and records a collection warning. The affected panels may be incomplete. For example, without `resourcequotas` access, Health cannot show real namespace quota `used/hard` values; without `limitranges` access, it cannot show namespace default request/limit policies; without `jobs` or `cronjobs` access, CronJob diagnostics cannot connect schedules to visible runs and pods.
 
 Prometheus mode additionally needs `get nodes/proxy` for kubelet and cAdvisor endpoints. Metrics Server mode needs read access to `nodes.metrics.k8s.io` and `pods.metrics.k8s.io`.
 
@@ -583,7 +649,7 @@ Dump mode prints one snapshot and exits:
 ./ktop-py.py --dump --output json
 ```
 
-JSON includes cluster metadata, nodes, pods, containers, metrics status, warnings, and loaded timestamp.
+JSON includes cluster metadata, nodes, pods, containers, CronJob diagnostics, metrics status, warnings, and loaded timestamp.
 
 Pod selection options:
 

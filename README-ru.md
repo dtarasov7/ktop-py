@@ -1,6 +1,6 @@
 # ktop-py.py
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](CHANGELOG-rus.md)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG-rus.md)
 
 `ktop-py.py` - это single-file TUI на Python 3.8 для мониторинга Kubernetes-кластера. Проект вдохновлен Go-утилитой `ktop`, которая лежит в подкаталоге `ktop/`, но рассчитан на copy-and-run сценарии: скопировать один файл и запустить без установки сторонних Python-пакетов.
 
@@ -19,6 +19,7 @@
 - Read-only viewer для `kubectl describe` и YAML выбранных nodes, namespaces, pods и owners.
 - Логи контейнера: current/previous, переключение контейнеров, timestamps, wrap, live search/highlight и plain copy mode.
 - Problems / Health экран для runtime-проблем, resource pressure, ResourceQuota/LimitRange policies и scheduler-fit checks.
+- Диагностика CronJob: dead-man проверка расписания, success/failure counts последних Job, percentiles длительности, связанные pod-ы, events и подсказки.
 - Resource Risk экран для missing requests/limits, usage ratios и top consumers.
 - Workload / Owner view для owner chain и controlled pods.
 - Metrics / RBAC diagnostics из TUI или CLI.
@@ -94,6 +95,7 @@ chmod +x ./ktop-py.py
 | `Tab` / `Shift+Tab` | Переключить фокус между overview-таблицами или между панелями на Health / Resource Risk |
 | `Left` / `Right` | Горизонтально прокрутить таблицу в фокусе |
 | `g` | Переключить верхнюю overview-таблицу между nodes и namespaces |
+| `j` | Открыть диагностику CronJob |
 | `2` | Открыть namespace picker |
 | `/` | Редактировать фильтр таблицы или live search в logs/describe/YAML |
 | `Enter` | Открыть выбранный node, namespace, pod или container logs |
@@ -111,9 +113,11 @@ chmod +x ./ktop-py.py
 
 Problems / Health использует такую же навигацию по панелям, как Resource Risk: `Tab` / `Shift+Tab` переключает панель в фокусе, `Up` / `Down` прокручивает строки, `Left` / `Right` прокручивает широкие строки по горизонтали.
 
+Диагностика CronJob работает в read-only режиме и использует загруженные `cronjobs`, `jobs`, `pods` и `events`. Страница `j` подсвечивает пропущенные расписания, failed latest Jobs, долгие active Jobs и регрессии длительности. `Enter` открывает detail-страницу CronJob с SLA percentiles, связанными pod-ами, recent Jobs, events и подсказками для проверки.
+
 Health resource pressure разделяет разные сигналы: memory usage и memory requests считаются более сильными capacity risks, CPU requests - более мягкий planning signal, а limits выше allocatable показываются как overcommit warning, а не как critical failure. ResourceQuota проверяется по `status.used/status.hard`; LimitRange показывает namespace resource policy defaults и bounds.
 
-Для полного вывода Health kubeconfig user должен уметь list `resourcequotas` и `limitranges` в дополнение к обычным nodes, pods, workloads, events, PV и PVC. Недостающие optional permissions показываются как collection warnings.
+Для полного вывода Health и CronJob kubeconfig user должен уметь list `resourcequotas`, `limitranges`, `jobs` и `cronjobs` в дополнение к обычным nodes, pods, workloads, events, PV и PVC. Недостающие optional permissions показываются как collection warnings.
 
 ## Метрики
 
@@ -163,6 +167,8 @@ echo "▁▂▃▄▅▆▇█"
 ```
 
 По умолчанию raw Kubernetes objects не включаются. Добавляйте `--include-raw` только когда они действительно нужны.
+
+JSON output включает секцию `cronjobs`: schedule status, last/next schedule, late seconds, success/failure counts, P50/P95/P99 длительности, latest Job status, severity и suggestions.
 
 ## Документация
 

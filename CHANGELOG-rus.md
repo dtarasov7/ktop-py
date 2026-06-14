@@ -2,6 +2,23 @@
 
 В этом файле фиксируются заметные изменения `ktop-py.py`.
 
+## [1.1.0] - 2026-06-14
+
+### Добавлено
+
+- Read-only CronJob diagnostics page, открывается клавишей `j`.
+- Dead-man schedule checks для пропущенных запусков CronJob на основе `lastScheduleTime`, fallback на creation time и grace из `startingDeadlineSeconds`.
+- Success/failure counts видимых Job и P50/P95/P99 percentiles длительности для CronJob.
+- CronJob detail page с suggestions, recent Jobs, related events и drill-down в related pods.
+- CronJob findings в Problems / Health и секция `cronjobs` в JSON/text dump.
+
+## [1.0.1] - 2026-06-14
+
+### Исправлено
+
+- Control characters теперь экранируются перед выводом в TUI, чтобы logs, metadata, describe и YAML не могли вносить управляющие байты в curses output.
+- Для live search добавлен безопасный fallback на substring при слишком длинных или потенциально дорогих regex, чтобы снизить риск локального зависания TUI.
+
 ## [1.0.0] - 2026-06-13
 
 Первый публичный релиз для GitHub.
