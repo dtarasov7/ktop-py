@@ -2,7 +2,7 @@
 
 [![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG.md)
 
-`ktop-py.py` is a single-file Python 3.8 terminal UI for Kubernetes cluster monitoring. It is inspired by the Go `ktop` project included in the `ktop/` subdirectory, but it is designed for copy-and-run use on machines where installing extra Python packages or copying a compiled binary is inconvenient.
+`ktop-py.py` is a single-file Python 3.8 terminal UI for Kubernetes cluster monitoring. It is inspired by the Go `ktop` project , but it is designed for copy-and-run use on machines where installing extra Python packages or copying a compiled binary is inconvenient.
 
 The program is read-only: it inspects Kubernetes objects, metrics, logs, describe output, YAML, health findings, and resource risk signals through `kubectl`.
 

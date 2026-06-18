@@ -2,7 +2,7 @@
 
 [![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG-rus.md)
 
-`ktop-py.py` - это single-file TUI на Python 3.8 для мониторинга Kubernetes-кластера. Проект вдохновлен Go-утилитой `ktop`, которая лежит в подкаталоге `ktop/`, но рассчитан на copy-and-run сценарии: скопировать один файл и запустить без установки сторонних Python-пакетов.
+`ktop-py.py` - это single-file TUI на Python 3.8 для мониторинга Kubernetes-кластера. Проект вдохновлен Go-утилитой `ktop`, но рассчитан на copy-and-run сценарии: скопировать один файл и запустить без установки сторонних Python-пакетов.
 
 Программа работает в read-only режиме: она показывает Kubernetes-объекты, метрики, логи, `describe`, YAML, health findings и resource risk signals через `kubectl`.
 
