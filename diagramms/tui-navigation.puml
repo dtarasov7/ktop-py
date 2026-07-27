@@ -13,6 +13,7 @@ Overview --> NamespacePicker : 2
 Overview --> Health : h or !
 Overview --> ResourceRisk : z
 Overview --> Diagnostics : x
+Overview --> CronJobs : j
 Overview --> Help : ?
 Overview --> ObjectViewer : d or y
 Overview --> Overview : g toggles\nnodes/namespaces
@@ -27,6 +28,15 @@ PodDetail --> OwnerView : o
 PodDetail --> ObjectViewer : d or y
 Logs --> ObjectViewer : d or y
 OwnerView --> ObjectViewer : d or y
+CronJobs --> CronJobDetail : Enter on CronJob
+CronJobs --> ObjectViewer : d or y
+CronJobDetail --> PodDetail : Enter on related pod
+CronJobDetail --> ObjectViewer : d or y
+
+note right of CronJobs
+  j opens this list from any page
+  except when it is already open.
+end note
 
 state "Previous page\nfrom navigation stack" as PreviousPage
 
@@ -37,6 +47,8 @@ ResourceRisk --> PreviousPage : Esc
 Diagnostics --> PreviousPage : Esc
 Help --> PreviousPage : Esc
 ObjectViewer --> PreviousPage : Esc
+CronJobs --> PreviousPage : Esc
+CronJobDetail --> PreviousPage : Esc
 Logs --> PodDetail : Esc
 OwnerView --> PodDetail : Esc
 NodeDetail --> Overview : Esc

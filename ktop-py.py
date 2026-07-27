@@ -32,16 +32,20 @@ import threading
 import textwrap
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-VERSION = "1.1.0"
-__VERSION__ = "1.1.0"
+VERSION = "1.2.0"
+__VERSION__ = "1.2.0"
 __AUTHOR__ = "Tarasov Dmitry"
 
 MIN_ROWS = 22
 DEFAULT_REFRESH_SECONDS = 5.0
+DEFAULT_SECONDARY_REFRESH_SECONDS = 30.0
+DEFAULT_POLICY_REFRESH_SECONDS = 60.0
+DEFAULT_KUBECTL_PARALLELISM = 6
 DEFAULT_PROMETHEUS_SCRAPE_SECONDS = 5.0
 DEFAULT_PROMETHEUS_RETENTION_SECONDS = 3600.0
 DEFAULT_PROMETHEUS_MAX_SAMPLES = 10000
@@ -222,6 +226,16 @@ def is_tab_key(key: Any) -> bool:
 class DataError(Exception):
     """User-facing data collection error. / Ошибка сбора данных, показываемая пользователю."""
     pass
+
+
+@dataclass
+class CommandTiming:
+    """One kubectl command measurement. / Измерение одного вызова kubectl."""
+
+    command: str
+    duration_s: float
+    stdout_bytes: int
+    status: str
 
 
 @dataclass
@@ -2271,6 +2285,15 @@ def build_snapshot(
         jobs_json,
         cronjobs_json,
     )
+    container_metrics_by_pod: Dict[Tuple[str, str], Dict[str, ResourceUsage]] = {}
+    container_histories_by_pod: Dict[Tuple[str, str], Dict[str, Tuple[List[float], List[float]]]] = {}
+    for (metric_namespace, metric_pod, metric_container), metric_usage in container_metrics.items():
+        pod_key = (metric_namespace, metric_pod)
+        container_metrics_by_pod.setdefault(pod_key, {})[metric_container] = metric_usage
+        container_histories_by_pod.setdefault(pod_key, {})[metric_container] = (
+            history_values(metric_history, history_key_container(metric_namespace, metric_pod, metric_container, "cpu")),
+            history_values(metric_history, history_key_container(metric_namespace, metric_pod, metric_container, "mem")),
+        )
 
     # Index pods by node once; requested resources and restart counts are
     # node aggregates derived from pods, not fields on the Node object.
@@ -2351,19 +2374,9 @@ def build_snapshot(
         node = node_by_name.get(node_name, {})
         node_alloc = safe_get(node, ["status", "allocatable"], {}) or {}
         ready, total = pod_ready_counts(pod)
-        container_usage_by_name = {
-            key[2]: value
-            for key, value in container_metrics.items()
-            if key[0] == namespace_name and key[1] == pod_name
-        }
-        container_history_by_name = {
-            key[2]: (
-                history_values(metric_history, history_key_container(namespace_name, pod_name, key[2], "cpu")),
-                history_values(metric_history, history_key_container(namespace_name, pod_name, key[2], "mem")),
-            )
-            for key in container_metrics
-            if key[0] == namespace_name and key[1] == pod_name
-        }
+        pod_key = (namespace_name, pod_name)
+        container_usage_by_name = container_metrics_by_pod.get(pod_key, {})
+        container_history_by_name = container_histories_by_pod.get(pod_key, {})
         containers = make_container_infos(pod, container_usage_by_name, container_history_by_name)
         pods.append(
             PodRow(
@@ -2489,10 +2502,53 @@ class KubectlClient:
         self.metrics_fresh = False
         self.prom_cached_metrics: Optional[Tuple[Dict[str, ResourceUsage], Dict[Tuple[str, str], ResourceUsage], Dict[Tuple[str, str, str], ResourceUsage], str, bool]] = None
         self.prom_last_scrape_at = 0.0
+        self.cluster_info_cache: Optional[Tuple[str, str, str]] = None
+        self.secondary_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self.command_timings: List[CommandTiming] = []
+        self.command_timings_lock = threading.Lock()
+        self.pending_scope_lock = threading.Lock()
+        self.pending_scope_value = ""
+        self.has_pending_scope = False
 
     def ensure_available(self) -> None:
         if shutil.which(self.kubectl) is None:
             raise DataError("kubectl not found in PATH. Use --demo to preview ktop-py.py without a cluster.")
+
+    def reset_command_timings(self) -> None:
+        with self.command_timings_lock:
+            self.command_timings = []
+
+    def record_command_timing(
+        self,
+        cmd: Sequence[str],
+        started_at: float,
+        stdout: Optional[str],
+        status: str,
+    ) -> None:
+        timing = CommandTiming(
+            command=" ".join(cmd),
+            duration_s=max(0.0, time.monotonic() - started_at),
+            stdout_bytes=len((stdout or "").encode("utf-8", errors="replace")),
+            status=status,
+        )
+        with self.command_timings_lock:
+            self.command_timings.append(timing)
+
+    def refresh_timing_lines(self, wall_seconds: float) -> List[str]:
+        with self.command_timings_lock:
+            timings = list(self.command_timings)
+        total_bytes = sum(item.stdout_bytes for item in timings)
+        total_command_seconds = sum(item.duration_s for item in timings)
+        lines = [
+            "timing refresh wall=%.3fs commands=%d kubectl-sum=%.3fs stdout=%s"
+            % (wall_seconds, len(timings), total_command_seconds, format_bytes(float(total_bytes)))
+        ]
+        for item in sorted(timings, key=lambda value: value.duration_s, reverse=True):
+            lines.append(
+                "timing %.3fs %s %s [%s]"
+                % (item.duration_s, format_bytes(float(item.stdout_bytes)), item.command, item.status)
+            )
+        return lines
 
     def base_cmd(self) -> List[str]:
         cmd = [self.kubectl]
@@ -2512,6 +2568,29 @@ class KubectlClient:
             return ["-n", namespace]
         return []
 
+    def queue_namespace_scope(self, namespace: Optional[str]) -> None:
+        """Apply a picker scope change at the start of the next snapshot."""
+        with self.pending_scope_lock:
+            self.pending_scope_value = (namespace or "").strip()
+            self.has_pending_scope = True
+
+    def apply_pending_namespace_scope(self) -> None:
+        """Switch collection scope between refreshes and invalidate scoped caches."""
+        with self.pending_scope_lock:
+            if not self.has_pending_scope:
+                return
+            namespace = self.pending_scope_value
+            self.has_pending_scope = False
+        all_namespaces = not bool(namespace)
+        if self.all_namespaces == all_namespaces and (
+            all_namespaces or self.default_namespace == namespace
+        ):
+            return
+        self.all_namespaces = all_namespaces
+        if namespace:
+            self.default_namespace = namespace
+        self.secondary_cache = {}
+
     def run(self, args: Sequence[str], timeout: Optional[float] = None) -> str:
         """Run kubectl and return stdout. / Запускает kubectl и возвращает stdout.
 
@@ -2524,6 +2603,7 @@ class KubectlClient:
             DataError: If kubectl is missing, times out, or exits non-zero.
         """
         cmd = self.base_cmd() + list(args)
+        started_at = time.monotonic()
         try:
             # kubectl is executed as an argv list with shell disabled.
             completed = subprocess.run(  # nosec B603
@@ -2534,9 +2614,14 @@ class KubectlClient:
                 timeout=timeout or self.args.command_timeout,
             )
         except FileNotFoundError as exc:
+            self.record_command_timing(cmd, started_at, "", "not-found")
             raise DataError("kubectl not found: %s" % exc) from exc
         except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            self.record_command_timing(cmd, started_at, stdout, "timeout")
             raise DataError("kubectl command timed out: %s" % " ".join(cmd)) from exc
+        status = "ok" if completed.returncode == 0 else "exit-%s" % completed.returncode
+        self.record_command_timing(cmd, started_at, completed.stdout, status)
         if completed.returncode != 0:
             stderr = completed.stderr.strip() or completed.stdout.strip() or "exit %s" % completed.returncode
             raise DataError("%s: %s" % (" ".join(cmd), stderr))
@@ -2586,25 +2671,18 @@ class KubectlClient:
             return {"items": []}
 
     def json_all_namespaces_or_scoped(self, resource: str, required: bool, warnings: List[str]) -> Dict[str, Any]:
-        """Load a namespaced resource across all namespaces with scoped fallback. / Загружает namespaced ресурс по всем namespace с fallback.
+        """Load a namespaced resource in the selected scope. / Загружает namespaced ресурс в выбранном scope.
 
         Args:
             resource: Kubernetes resource name accepted by ``kubectl get``.
-            required: Whether the scoped fallback must succeed.
-            warnings: Mutable warning list for fallback reasons.
+            required: Whether the scoped request must succeed.
+            warnings: Mutable warning list for optional failures.
         Returns:
             Parsed JSON list object.
         Raises:
-            DataError: If both all-namespaces and required scoped calls fail.
+            DataError: If a required scoped call fails.
         """
-        if self.all_namespaces:
-            return self.json(["get", resource, "-A"], required=required, warnings=warnings)
-        try:
-            text = self.run(["get", resource, "-A", "-o", "json"])
-            return json.loads(text)
-        except (DataError, json.JSONDecodeError) as exc:
-            warnings.append("all namespaces %s unavailable, using %s: %s" % (resource, self.default_namespace, exc))
-            return self.json(["get", resource] + self.scope_args(), required=required, warnings=warnings)
+        return self.json(["get", resource] + self.scope_args(), required=required, warnings=warnings)
 
     def cluster_info(self, warnings: List[str]) -> Tuple[str, str, str]:
         """Load context, user, and server version. / Загружает context, user и версию сервера.
@@ -2614,6 +2692,8 @@ class KubectlClient:
         Returns:
             Tuple of context, user, and Kubernetes version.
         """
+        if self.cluster_info_cache is not None:
+            return self.cluster_info_cache
         context = self.args.context or "-"
         user = "-"
         version = "-"
@@ -2633,7 +2713,8 @@ class KubectlClient:
             version = safe_get(version_json, ["serverVersion", "gitVersion"], "-") or "-"
         except (DataError, json.JSONDecodeError) as exc:
             warnings.append(str(exc))
-        return context, user, version
+        self.cluster_info_cache = (context, user, version)
+        return self.cluster_info_cache
 
     def prometheus_scrape_interval(self) -> float:
         return max(0.0, float(getattr(self.args, "prometheus_scrape_interval", DEFAULT_PROMETHEUS_SCRAPE_SECONDS) or 0.0))
@@ -3081,50 +3162,145 @@ class KubectlClient:
             self.metrics_fresh = False
             return {}, {}, {}, "not connected", False
 
-    def load_snapshot(self) -> ClusterSnapshot:
-        """Load one complete cluster snapshot. / Загружает один полный снимок кластера.
+    def secondary_refresh_interval(self) -> float:
+        return max(
+            1.0,
+            float(
+                getattr(self.args, "secondary_refresh_interval", DEFAULT_SECONDARY_REFRESH_SECONDS)
+                or DEFAULT_SECONDARY_REFRESH_SECONDS
+            ),
+        )
 
-        Returns:
-            ClusterSnapshot with Kubernetes objects, metrics, histories, and warnings.
-        Raises:
-            DataError: If required kubectl calls fail.
-        """
-        self.ensure_available()
-        warnings: List[str] = []
-        context, user, version = self.cluster_info(warnings)
-        nodes_json = self.json(["get", "nodes"], required=True, warnings=warnings)
-        pods_json = self.json_all_namespaces_or_scoped("pods", required=True, warnings=warnings)
-        deployments_json = self.json_all_namespaces_or_scoped("deployments", required=False, warnings=warnings)
-        replicasets_json = self.json_all_namespaces_or_scoped("replicasets", required=False, warnings=warnings)
-        statefulsets_json = self.json_all_namespaces_or_scoped("statefulsets", required=False, warnings=warnings)
-        daemonsets_json = self.json_all_namespaces_or_scoped("daemonsets", required=False, warnings=warnings)
-        jobs_json = self.json_all_namespaces_or_scoped("jobs", required=False, warnings=warnings)
-        cronjobs_json = self.json_all_namespaces_or_scoped("cronjobs", required=False, warnings=warnings)
-        namespaces_json = self.json(["get", "namespaces"], required=False, warnings=warnings)
-        resourcequotas_json = self.json_all_namespaces_or_scoped("resourcequotas", required=False, warnings=warnings)
-        limitranges_json = self.json_all_namespaces_or_scoped("limitranges", required=False, warnings=warnings)
-        pv_json = self.json(["get", "pv"], required=False, warnings=warnings)
-        pvc_json = self.json_all_namespaces_or_scoped("pvc", required=False, warnings=warnings)
-        events_json = self.json_all_namespaces_or_scoped("events", required=False, warnings=warnings)
-        node_metrics, pod_metrics, container_metrics, metrics_status, metrics_available = self.load_metrics(warnings, nodes_json)
-        if metrics_available and self.metrics_fresh:
-            self.record_usage_history(node_metrics, pod_metrics, container_metrics, time.time())
+    def kubectl_parallelism(self) -> int:
+        return max(
+            1,
+            int(
+                getattr(self.args, "kubectl_parallelism", DEFAULT_KUBECTL_PARALLELISM)
+                or DEFAULT_KUBECTL_PARALLELISM
+            ),
+        )
+
+    def secondary_resource_specs(self) -> List[Tuple[str, str, bool, float]]:
+        regular_ttl = self.secondary_refresh_interval()
+        policy_ttl = max(DEFAULT_POLICY_REFRESH_SECONDS, regular_ttl)
+        return [
+            ("deployments", "deployments", True, regular_ttl),
+            ("replicasets", "replicasets", True, regular_ttl),
+            ("statefulsets", "statefulsets", True, regular_ttl),
+            ("daemonsets", "daemonsets", True, regular_ttl),
+            ("jobs", "jobs", True, regular_ttl),
+            ("cronjobs", "cronjobs", True, regular_ttl),
+            ("namespaces", "namespaces", False, regular_ttl),
+            ("resourcequotas", "resourcequotas", True, policy_ttl),
+            ("limitranges", "limitranges", True, policy_ttl),
+            ("pv", "pv", False, regular_ttl),
+            ("pvc", "pvc", True, regular_ttl),
+            ("events", "events", True, regular_ttl),
+        ]
+
+    def cached_secondary_resources(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            key: self.secondary_cache.get(key, (0.0, {"items": []}))[1]
+            for key, _, _, _ in self.secondary_resource_specs()
+        }
+
+    def fetch_secondary_resource(
+        self,
+        resource: str,
+        namespaced: bool,
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        local_warnings: List[str] = []
+        if namespaced:
+            value = self.json_all_namespaces_or_scoped(resource, required=False, warnings=local_warnings)
+        else:
+            value = self.json(["get", resource], required=False, warnings=local_warnings)
+        return value, local_warnings
+
+    def load_secondary_resources(
+        self,
+        warnings: List[str],
+        force: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Refresh slow, non-overview resources with bounded concurrency and TTL caching."""
+        now = time.monotonic()
+        pending: List[Tuple[str, str, bool, float]] = []
+        for spec in self.secondary_resource_specs():
+            key, _, _, ttl = spec
+            cached_at = self.secondary_cache.get(key, (0.0, {"items": []}))[0]
+            if force or key not in self.secondary_cache or now - cached_at >= ttl:
+                pending.append(spec)
+        if pending:
+            workers = min(self.kubectl_parallelism(), len(pending))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ktop-kubectl") as executor:
+                futures = {
+                    executor.submit(self.fetch_secondary_resource, resource, namespaced): key
+                    for key, resource, namespaced, _ in pending
+                }
+                for future in as_completed(futures):
+                    key = futures[future]
+                    try:
+                        value, local_warnings = future.result()
+                    except Exception as exc:
+                        value = {"items": []}
+                        local_warnings = ["secondary resource %s failed: %s" % (key, exc)]
+                    self.secondary_cache[key] = (time.monotonic(), value)
+                    warnings.extend(local_warnings)
+        return self.cached_secondary_resources()
+
+    def load_primary_resources(
+        self,
+        warnings: List[str],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Load nodes and pods concurrently; both are required for the overview."""
+        node_warnings: List[str] = []
+        pod_warnings: List[str] = []
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ktop-primary") as executor:
+            nodes_future = executor.submit(self.json, ["get", "nodes"], True, node_warnings)
+            pods_future = executor.submit(
+                self.json_all_namespaces_or_scoped,
+                "pods",
+                True,
+                pod_warnings,
+            )
+            nodes_json = nodes_future.result()
+            pods_json = pods_future.result()
+        warnings.extend(node_warnings)
+        warnings.extend(pod_warnings)
+        return nodes_json, pods_json
+
+    def build_collected_snapshot(
+        self,
+        nodes_json: Dict[str, Any],
+        pods_json: Dict[str, Any],
+        secondary: Dict[str, Dict[str, Any]],
+        metrics: Tuple[
+            Dict[str, ResourceUsage],
+            Dict[Tuple[str, str], ResourceUsage],
+            Dict[Tuple[str, str, str], ResourceUsage],
+            str,
+            bool,
+        ],
+        cluster_info: Tuple[str, str, str],
+        warnings: List[str],
+    ) -> ClusterSnapshot:
+        node_metrics, pod_metrics, container_metrics, metrics_status, metrics_available = metrics
+        context, user, version = cluster_info
         namespace_display = "(all)" if self.all_namespaces else self.default_namespace
         return build_snapshot(
             nodes_json,
             pods_json,
-            deployments_json,
-            replicasets_json,
-            statefulsets_json,
-            daemonsets_json,
-            jobs_json,
-            cronjobs_json,
-            namespaces_json,
-            resourcequotas_json,
-            limitranges_json,
-            pv_json,
-            pvc_json,
-            events_json,
+            secondary["deployments"],
+            secondary["replicasets"],
+            secondary["statefulsets"],
+            secondary["daemonsets"],
+            secondary["jobs"],
+            secondary["cronjobs"],
+            secondary["namespaces"],
+            secondary["resourcequotas"],
+            secondary["limitranges"],
+            secondary["pv"],
+            secondary["pvc"],
+            secondary["events"],
             node_metrics,
             pod_metrics,
             container_metrics,
@@ -3135,8 +3311,94 @@ class KubectlClient:
             namespace_display,
             metrics_status,
             metrics_available,
+            list(warnings),
+        )
+
+    def load_snapshot_internal(
+        self,
+        progress_callback: Optional[Callable[[ClusterSnapshot], None]] = None,
+        force_secondary: bool = False,
+    ) -> ClusterSnapshot:
+        self.apply_pending_namespace_scope()
+        self.ensure_available()
+        self.reset_command_timings()
+        refresh_started_at = time.monotonic()
+        warnings: List[str] = []
+        nodes_json, pods_json = self.load_primary_resources(warnings)
+
+        source = (self.args.metrics_source or "prometheus").lower()
+        partial_metrics: Tuple[
+            Dict[str, ResourceUsage],
+            Dict[Tuple[str, str], ResourceUsage],
+            Dict[Tuple[str, str, str], ResourceUsage],
+            str,
+            bool,
+        ]
+        if source in ("none", "off", "disabled"):
+            partial_metrics = ({}, {}, {}, "none", False)
+        elif self.prom_cached_metrics is not None:
+            partial_metrics = self.prom_cached_metrics
+        else:
+            partial_metrics = ({}, {}, {}, "loading", False)
+        partial_info = self.cluster_info_cache or (self.args.context or "-", "-", "-")
+        if progress_callback is not None:
+            progress_callback(
+                self.build_collected_snapshot(
+                    nodes_json,
+                    pods_json,
+                    self.cached_secondary_resources(),
+                    partial_metrics,
+                    partial_info,
+                    warnings,
+                )
+            )
+
+        info_warnings: List[str] = []
+        secondary_warnings: List[str] = []
+        metrics_warnings: List[str] = []
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="ktop-snapshot") as executor:
+            info_future = executor.submit(self.cluster_info, info_warnings)
+            secondary_future = executor.submit(
+                self.load_secondary_resources,
+                secondary_warnings,
+                force_secondary,
+            )
+            metrics_future = executor.submit(self.load_metrics, metrics_warnings, nodes_json)
+            cluster_info = info_future.result()
+            secondary = secondary_future.result()
+            metrics = metrics_future.result()
+        warnings.extend(info_warnings)
+        warnings.extend(secondary_warnings)
+        warnings.extend(metrics_warnings)
+
+        node_metrics, pod_metrics, container_metrics, _, metrics_available = metrics
+        if metrics_available and self.metrics_fresh:
+            self.record_usage_history(node_metrics, pod_metrics, container_metrics, time.time())
+        snapshot = self.build_collected_snapshot(
+            nodes_json,
+            pods_json,
+            secondary,
+            metrics,
+            cluster_info,
             warnings,
         )
+        if getattr(self.args, "profile_refresh", False):
+            snapshot.warnings.extend(
+                self.refresh_timing_lines(time.monotonic() - refresh_started_at)
+            )
+        return snapshot
+
+    def load_snapshot(self) -> ClusterSnapshot:
+        """Load a complete snapshot; secondary resources may come from their TTL cache."""
+        return self.load_snapshot_internal()
+
+    def load_snapshot_progressive(
+        self,
+        progress_callback: Callable[[ClusterSnapshot], None],
+        force_secondary: bool = False,
+    ) -> ClusterSnapshot:
+        """Publish nodes/pods first, then return the fully enriched snapshot."""
+        return self.load_snapshot_internal(progress_callback, force_secondary)
 
     def diagnostic_timeout(self) -> float:
         return max(3.0, min(float(self.args.command_timeout or 8.0), 10.0))
@@ -4887,9 +5149,19 @@ class KtopApp:
             force: Whether to show success feedback when loading finishes.
         """
         try:
-            snapshot = self.client.load_snapshot()
-            with self.snapshot_lock:
-                self.snapshot = snapshot
+            def publish_snapshot(snapshot: ClusterSnapshot) -> None:
+                with self.snapshot_lock:
+                    self.snapshot = snapshot
+
+            progressive_loader = getattr(self.client, "load_snapshot_progressive", None)
+            if callable(progressive_loader):
+                snapshot = progressive_loader(
+                    publish_snapshot,
+                    force_secondary=force,
+                )
+            else:
+                snapshot = self.client.load_snapshot()
+            publish_snapshot(snapshot)
             self.last_refresh = time.time()
             if force:
                 self.flash("cluster data loaded")
@@ -7779,10 +8051,15 @@ class KtopApp:
             return
         value = rows[min(self.selected.get("namespaces", 0), len(rows) - 1)]
         self.filters["namespace"] = "" if value == "(all)" else value
+        queue_scope = getattr(self.client, "queue_namespace_scope", None)
+        if callable(queue_scope):
+            queue_scope(None if value == "(all)" else value)
         self.filters["namespace_picker"] = ""
         self.reset_selections()
         self.flash("namespace: %s" % (value if value != "(all)" else "(all)"))
         self.pop_page()
+        if callable(queue_scope):
+            self.refresh_snapshot(force=False)
 
     def active_search_query(self, key: str) -> str:
         """Return committed or live viewer/log search text. / Возвращает сохраненный или live search-текст.
@@ -9430,6 +9707,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pod-columns", default="", help="Comma-separated pod columns to display")
     parser.add_argument("--show-all-columns", action="store_true", default=True, help="Compatibility flag; all columns are shown unless column lists are provided")
     parser.add_argument("--refresh-interval", type=float, default=DEFAULT_REFRESH_SECONDS, help="TUI refresh interval in seconds")
+    parser.add_argument("--secondary-refresh-interval", type=parse_duration_seconds, default=DEFAULT_SECONDARY_REFRESH_SECONDS, help="TTL for workloads, policies, volumes, and events; accepts seconds or 15s/5m/1h suffixes")
+    parser.add_argument("--kubectl-parallelism", type=parse_positive_int, default=DEFAULT_KUBECTL_PARALLELISM, help="Maximum parallel kubectl requests for secondary resources")
+    parser.add_argument("--profile-refresh", action="store_true", help="Append per-command kubectl refresh timings to snapshot warnings")
     parser.add_argument("--request-timeout", default="8s", help="kubectl --request-timeout value")
     parser.add_argument("--command-timeout", type=float, default=12.0, help="subprocess timeout for kubectl commands")
     parser.add_argument("--kubectl", default=os.environ.get("KUBECTL", "kubectl"), help="kubectl executable path")
@@ -9756,6 +10036,104 @@ def run_self_test() -> int:
     namespace_args = normalize_display_scope(build_arg_parser().parse_args(["--demo", "-n", "kube-system"]))
     assert not namespace_args.all_namespaces
     assert namespace_args.namespace == "kube-system"
+    performance_args = normalize_display_scope(
+        build_arg_parser().parse_args(
+            [
+                "--metrics-source",
+                "none",
+                "--secondary-refresh-interval",
+                "45s",
+                "--kubectl-parallelism",
+                "3",
+                "-n",
+                "kube-system",
+            ]
+        )
+    )
+    assert performance_args.secondary_refresh_interval == 45.0
+    assert performance_args.kubectl_parallelism == 3
+
+    scope_client = KubectlClient(performance_args)
+    scope_commands: List[List[str]] = []
+
+    def fake_scope_json(command: Sequence[str], required: bool, warnings: List[str]) -> Dict[str, Any]:
+        del required, warnings
+        scope_commands.append(list(command))
+        return {"items": []}
+
+    scope_client.json = fake_scope_json  # type: ignore[assignment]
+    scope_client.json_all_namespaces_or_scoped("pods", True, [])
+    assert scope_commands == [["get", "pods", "-n", "kube-system"]]
+    scope_client.secondary_cache["events"] = (time.monotonic(), {"items": [{"metadata": {"name": "old"}}]})
+    scope_client.queue_namespace_scope(None)
+    scope_client.apply_pending_namespace_scope()
+    assert scope_client.all_namespaces
+    assert not scope_client.secondary_cache
+    scope_client.queue_namespace_scope("kube-system")
+    scope_client.apply_pending_namespace_scope()
+    assert not scope_client.all_namespaces
+    assert scope_client.default_namespace == "kube-system"
+
+    cluster_client = KubectlClient(performance_args)
+    cluster_commands: List[List[str]] = []
+
+    def fake_cluster_run(command: Sequence[str], timeout: Optional[float] = None) -> str:
+        del timeout
+        cluster_commands.append(list(command))
+        if list(command) == ["config", "current-context"]:
+            return "test-context\n"
+        if list(command)[:2] == ["config", "view"]:
+            return '{"contexts":[{"context":{"user":"test-user"}}]}'
+        return '{"serverVersion":{"gitVersion":"v1.test"}}'
+
+    cluster_client.run = fake_cluster_run  # type: ignore[assignment]
+    assert cluster_client.cluster_info([]) == ("test-context", "test-user", "v1.test")
+    assert cluster_client.cluster_info([]) == ("test-context", "test-user", "v1.test")
+    assert len(cluster_commands) == 3
+
+    timing_client = KubectlClient(performance_args)
+    original_subprocess_run = subprocess.run
+
+    def fake_subprocess_run(command: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        del kwargs
+        return subprocess.CompletedProcess(list(command), 0, '{"items":[]}', "")
+
+    try:
+        subprocess.run = fake_subprocess_run  # type: ignore[assignment]
+        assert timing_client.run(["get", "nodes"]) == '{"items":[]}'
+    finally:
+        subprocess.run = original_subprocess_run  # type: ignore[assignment]
+    assert len(timing_client.command_timings) == 1
+    assert timing_client.command_timings[0].status == "ok"
+    assert timing_client.command_timings[0].stdout_bytes == len('{"items":[]}')
+    assert timing_client.refresh_timing_lines(0.1)[0].startswith("timing refresh wall=0.100s commands=1")
+
+    secondary_client = KubectlClient(performance_args)
+    secondary_calls: List[str] = []
+
+    def fake_secondary_fetch(resource: str, namespaced: bool) -> Tuple[Dict[str, Any], List[str]]:
+        del namespaced
+        secondary_calls.append(resource)
+        return {"items": []}, []
+
+    secondary_client.fetch_secondary_resource = fake_secondary_fetch  # type: ignore[assignment]
+    assert len(secondary_client.load_secondary_resources([])) == 12
+    assert len(secondary_calls) == 12
+    secondary_client.load_secondary_resources([])
+    assert len(secondary_calls) == 12
+    secondary_client.load_secondary_resources([], force=True)
+    assert len(secondary_calls) == 24
+
+    progressive_client = KubectlClient(performance_args)
+    progressive_client.ensure_available = lambda: None  # type: ignore[assignment]
+    progressive_client.load_primary_resources = lambda warnings: ({"items": []}, {"items": []})  # type: ignore[assignment]
+    progressive_client.cluster_info = lambda warnings: ("test-context", "test-user", "v1.test")  # type: ignore[assignment]
+    progressive_client.load_secondary_resources = lambda warnings, force=False: progressive_client.cached_secondary_resources()  # type: ignore[assignment]
+    progressive_updates: List[ClusterSnapshot] = []
+    progressive_snapshot = progressive_client.load_snapshot_progressive(progressive_updates.append)
+    assert len(progressive_updates) == 1
+    assert progressive_updates[0].metrics_status == "none"
+    assert progressive_snapshot.context == "test-context"
     snapshot = DemoClient(args).load_snapshot()
     assert len(snapshot.nodes) == 2
     assert len(snapshot.pods) >= 5

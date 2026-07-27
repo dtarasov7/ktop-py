@@ -13,22 +13,32 @@ else (no)
   :Start daemon refresh worker;
 endif
 
-:KubectlClient loads cluster objects;
+:KubectlClient loads cluster identity and objects;
 :Get nodes, pods, namespaces;
-:Get workloads, ResourceQuotas,\nLimitRanges, PVs, PVCs, and events;
-if (Metrics source) then (prometheus)
-  :Scrape kubelet and cAdvisor through nodes/proxy;
+:Get deployments, replicasets, statefulsets,\ndaemonsets, jobs, and cronjobs;
+:Get ResourceQuotas, LimitRanges,\nPVs, PVCs, and events;
+if (Metrics source) then (prometheus/prom)
+  :Scrape configured kubelet/cAdvisor\ncomponents through nodes/proxy;
   :Parse Prometheus text;
+  if (Prometheus unavailable and source implicit?) then (yes)
+    :Warn and fall back to metrics-server;
+    :Read metrics.k8s.io nodes and pods;
+    :Parse metrics JSON;
+  else (no)
+    :Use Prometheus metrics\nor raise explicit-source error;
+  endif
 elseif (metrics-server)
   :Read metrics.k8s.io nodes and pods;
   :Parse metrics JSON;
 else (none)
-  :Use request and allocatable fallback;
+  :Mark live metrics unavailable;
 endif
 
-:Build normalized ClusterSnapshot;
-:Update in-process metric history;
+:When live metrics are fresh,\nrecord history in KubectlClient;
+:Build normalized ClusterSnapshot\nfrom objects, metrics, and retained history;
+:Resolve workload owner chains\nand CronJob/job data;
 :Health uses quotas, limit ranges,\nand scheduler-fit checks;
+:Resource Risk and dumps use request fallback\nwhere live usage is unavailable;
 :Publish snapshot under lock;
 :Header shows loaded, stale, loading, or error state;
 stop

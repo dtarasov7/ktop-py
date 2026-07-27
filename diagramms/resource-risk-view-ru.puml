@@ -15,8 +15,10 @@ start
 if (Live metrics доступны?) then (да)
   :Посчитать usage/request ratios;
   :Посчитать usage/limit ratios;
+  :Использовать live pod usage для top consumers;
 else (нет)
   :Показать, что live usage ratios недоступны;
+  :Использовать pod requests как fallback для top consumers;
 endif
 :Агрегировать top CPU и memory по namespace;
 :Агрегировать top CPU и memory по workload owner;

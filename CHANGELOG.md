@@ -2,6 +2,23 @@
 
 All notable changes to `ktop-py.py` are documented in this file.
 
+## [1.2.0] - 2026-07-24
+
+### Added
+
+- Added progressive overview updates: nodes and pods are published before detail resources finish loading.
+- Added `--secondary-refresh-interval`, `--kubectl-parallelism`, and `--profile-refresh` performance controls.
+
+### Changed
+
+- Nodes and pods now load concurrently; workloads, policies, volumes, and events use bounded parallel collection with TTL caching.
+- Kubernetes context, user, and server version are cached for the process lifetime.
+- `--namespace` now scopes namespaced `kubectl get` requests instead of first loading all namespaces.
+
+### Fixed
+
+- Removed repeated full container-metrics scans for every pod when building a snapshot.
+
 ## [1.1.0] - 2026-06-14
 
 ### Added

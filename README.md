@@ -1,6 +1,6 @@
 # ktop-py.py
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG.md)
 
 `ktop-py.py` is a single-file Python 3.8 terminal UI for Kubernetes cluster monitoring. It is inspired by the Go `ktop` project , but it is designed for copy-and-run use on machines where installing extra Python packages or copying a compiled binary is inconvenient.
 
@@ -152,6 +152,19 @@ echo "▁▂▃▄▅▆▇█"
 ```
 
 When connecting from Windows through PuTTY, choose a font that includes these glyphs; `Cascadia Mono` or `Cascadia Code` is a known good example. Use `--graph-style ascii` or `KTOP_PY_GRAPH_STYLE=ascii` only as a fallback for terminals without those glyphs.
+
+## kubectl Refresh Performance
+
+The overview loads nodes and pods in parallel and publishes them before slower detail resources finish. Workloads, policies, volumes, and events are fetched with bounded parallelism and cached for 30 seconds by default; context, user, and server version are cached for the process lifetime.
+
+For a cluster where the header shows `Metrics: None`, tune the Kubernetes object path rather than Prometheus settings:
+
+```bash
+./ktop-py.py --metrics-source none --secondary-refresh-interval 60s --kubectl-parallelism 6
+./ktop-py.py --dump --metrics-source none --profile-refresh
+```
+
+`--namespace` now scopes namespaced `kubectl get` requests, reducing transferred and parsed data. `--profile-refresh` adds wall time and per-command timings to snapshot warnings.
 
 ## JSON Dump
 

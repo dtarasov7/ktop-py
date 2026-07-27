@@ -552,7 +552,7 @@ Diagnostics проверяет:
 
 ## Загружаемые Kubernetes-объекты и RBAC
 
-Каждый refresh загружает read-only snapshot через `kubectl`. Для максимально полного отображения kubeconfig user должен уметь list:
+Overview загружает nodes и pods при каждом refresh. Более медленные detail-объекты загружаются через `kubectl` с ограниченным параллелизмом и по умолчанию кешируются на 30 секунд. Для максимально полного отображения kubeconfig user должен уметь list:
 
 - `nodes`, `pods`, `namespaces`, `events`,
 - `deployments`, `replicasets`, `statefulsets`, `daemonsets`, `jobs`, `cronjobs`,
@@ -744,13 +744,22 @@ kubectl get --raw /apis/metrics.k8s.io/v1beta1/pods
 
 ### TUI кажется зависшим во время refresh
 
-Snapshot refresh выполняется в background worker. UI продолжает рисовать последний успешный snapshot. Header показывает loading, stale или error state.
+Snapshot refresh выполняется в background worker. Nodes и pods загружаются параллельно и публикуются первыми; более медленные workloads, policies, volumes и events дополняют snapshot позже. Header показывает loading, stale или error state.
 
-Если kubectl commands медленные, сузьте scope через `--namespace`, проверьте latency API server или увеличьте command timeout:
+Если header показывает `Metrics: None`, разбор Prometheus не участвует в этом refresh. Сначала измерьте реальные вызовы `kubectl`:
 
 ```bash
-./ktop-py.py --command-timeout 30
+./ktop-py.py --dump --metrics-source none --profile-refresh
 ```
+
+Для медленного API server увеличьте TTL detail-ресурсов, оставьте подходящий для API server ограниченный параллелизм или уменьшите объем namespaced-данных через `--namespace`:
+
+```bash
+./ktop-py.py --metrics-source none --secondary-refresh-interval 60s --kubectl-parallelism 6
+./ktop-py.py --namespace production --metrics-source none
+```
+
+Увеличивайте `--command-timeout` только при timeout: успешные медленные запросы этот параметр не ускоряет.
 
 ## Команды проверки
 

@@ -11,30 +11,33 @@ package "Один исполняемый файл: ktop-py.py" {
   component "KubectlClient" as Client
   component "DemoClient" as Demo
   component "Snapshot Builder" as Builder
-  component "Сборщики метрик" as Metrics
+  component "Загрузчики метрик\nPrometheus, metrics-server, none" as Metrics
   component "Prometheus Parser" as PromParser
   component "Metrics Server Parser" as MetricsParser
-  component "Renderers\nтаблицы, детали, графики" as Renderers
+  component "Renderers\nтаблицы, детали, CronJobs, графики" as Renderers
   component "Текстовые viewer\nlogs, describe, YAML" as Viewers
-  component "Risk and Diagnostics\nhealth, resource risk, scheduler fit, RBAC checks" as Diagnostics
-  database "История метрик" as History
+  component "CronJob Analyzer\nschedule, runs, related pods" as CronJobs
+  component "Health и Resource Risk\nquotas, limits, scheduler fit, RBAC checks" as Diagnostics
+  database "История метрик\nretained samples в KubectlClient" as History
 }
 
 Cli --> App : parsed args
 Cli --> Client : режим реального кластера
 Cli --> Demo : demo-режим
-App --> Client : refresh snapshot, logs, describe, YAML
+App --> Client : refresh snapshot, logs, describe, YAML, diagnostics
 App --> Demo : synthetic snapshot and logs
-Client --> Metrics : загрузка метрик
+Client --> Metrics : load_metrics()
 Metrics --> PromParser : kubelet/cAdvisor text
 Metrics --> MetricsParser : metrics.k8s.io JSON
-Client --> Builder : Kubernetes JSON + metrics
+Metrics --> History : свежие live samples
+Client --> Builder : Kubernetes JSON + metrics + history
 Demo --> Builder : synthetic Kubernetes JSON + metrics
-Builder --> History : сохраненные samples
-History --> Builder : предыдущие samples
+History --> Builder : retained samples
 Builder --> App : ClusterSnapshot
-App --> Renderers : overview и detail pages
+App --> CronJobs : build rows из snapshot workloads
+CronJobs --> Renderers : CronJob list и detail
+App --> Renderers : overview, details, tables, charts
 App --> Viewers : logs, describe, YAML
-App --> Diagnostics : health, resource risk, scheduler fit, diagnostics
+App --> Diagnostics : health, resource risk, diagnostics
 
 @enduml

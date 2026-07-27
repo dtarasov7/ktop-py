@@ -9,6 +9,7 @@ actor "Operator" as Operator
 
 rectangle "Terminal Session" as Terminal {
   component "ktop-py.py\nPython 3.8 curses TUI" as App
+  component "KubectlClient\nmetric cache/history owner" as Client
 }
 
 component "kubectl" as Kubectl
@@ -23,12 +24,13 @@ database "In-process metric history\nretention only in memory" as History
 
 Operator --> App : keyboard input
 App --> Terminal : curses rendering
-App --> Kubectl : subprocess calls
+App --> Client : refresh, logs, diagnostics
+Client --> Kubectl : subprocess calls
 Kubectl --> ApiServer : kubeconfig context/user
 ApiServer --> MetricsServer : aggregated metrics API
 ApiServer --> Kubelet : nodes/proxy
 ApiServer --> Cadvisor : nodes/proxy
-App --> History : append samples
+Client --> History : append fresh live samples
 History --> App : charts, trends, max values
 
 @enduml

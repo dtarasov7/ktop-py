@@ -552,7 +552,7 @@ The goal is to explain why Prometheus mode or Metrics Server mode is not providi
 
 ## Loaded Kubernetes Objects and RBAC
 
-Each refresh loads a read-only snapshot through `kubectl`. For the richest view, the kubeconfig user should be able to list:
+The overview loads nodes and pods on every refresh. Slower detail objects are loaded through `kubectl` with bounded parallelism and a 30-second TTL cache by default. For the richest view, the kubeconfig user should be able to list:
 
 - `nodes`, `pods`, `namespaces`, `events`,
 - `deployments`, `replicasets`, `statefulsets`, `daemonsets`, `jobs`, `cronjobs`,
@@ -744,13 +744,22 @@ Use a UTF-8 locale and a font with box-drawing and block glyphs. If only graph g
 
 ### The TUI feels stuck during refresh
 
-Snapshot refresh runs in a background worker. The UI keeps rendering the last successful snapshot. The header shows loading, stale, or error state.
+Snapshot refresh runs in a background worker. Nodes and pods are loaded in parallel and published first; slower workloads, policies, volumes, and events enrich the snapshot afterward. The header shows loading, stale, or error state.
 
-If kubectl commands are slow, reduce scope with `--namespace`, check API server latency, or increase command timeout:
+If the header shows `Metrics: None`, Prometheus parsing is not part of this refresh path. Profile the actual `kubectl` calls:
 
 ```bash
-./ktop-py.py --command-timeout 30
+./ktop-py.py --dump --metrics-source none --profile-refresh
 ```
+
+For slow API servers, increase the secondary-resource TTL, keep bounded parallelism appropriate for the API server, or reduce namespaced data with `--namespace`:
+
+```bash
+./ktop-py.py --metrics-source none --secondary-refresh-interval 60s --kubectl-parallelism 6
+./ktop-py.py --namespace production --metrics-source none
+```
+
+Increase `--command-timeout` only when requests time out; it does not make successful slow requests faster.
 
 ## Verification Commands
 
