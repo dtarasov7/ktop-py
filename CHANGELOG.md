@@ -2,6 +2,38 @@
 
 All notable changes to `ktop-py.py` are documented in this file.
 
+## [1.3.0] - 2026-09-17
+
+### Added
+
+- Added read-only incident diagnostics for Service → EndpointSlice → Pod relationships, degradation causes, incident timelines, and workload security contexts. The network view also links related Ingress and NetworkPolicy objects and clearly separates static configuration analysis from connectivity testing.
+- Added CPU CFS throttling rates, OOMKilled details, init-container failures, probe failures, eviction/ephemeral-storage findings, and node pressure to Problems / Health.
+- Added versioned JSON snapshots with `schema_version: 1`, UID-aware `--diff`, and offline `--replay` with `F5`/`F6` frame navigation.
+- Added scoped support bundles with namespace/object selectors, atomic mode-0600 writes, source age/completeness metadata, explicit `--include-raw`, and best-effort sensitive-data redaction.
+- Added command palette, Literal/Regex mode, source-status view, saved column/filter presets, breadcrumbs, compact terminal layout, and Unicode display-width handling.
+- Added `--namespace-only`, server-side pod label/field selectors, bounded scrape parallelism/deadlines, and extended refresh profiling.
+
+### Changed
+
+- Logs, describe, YAML, and diagnostics now run in cancelable background jobs; stale results are rejected when the selected object changes.
+- Metrics and secondary-source state now distinguish missing, zero, stale, forbidden, unavailable, and not-yet-loaded data without substituting requests for live usage.
+- Refresh work now uses bounded concurrency, TTL caches, pod indexes, ring buffers, cached rendering/search results, and early Prometheus metric filtering.
+- Resource calculations now account for init containers, restartable sidecars, ephemeral containers, pod overhead, metric timestamps, and gaps in aggregate history.
+
+### Security
+
+- Regex search is literal by default; explicit regex evaluation has a hard time budget in a separate process.
+- Subprocess output, logs, JSON input, metric histories, and Prometheus counter state now have explicit size or retention limits.
+- Terminal-bound external text and invalid UTF-8 are rendered safely, and kubeconfig inspection no longer reads unnecessary raw credential data.
+- Metrics/RBAC guidance now describes the elevated reach of `nodes/proxy` and recommends the lower-privilege Metrics Server path where suitable.
+
+### Fixed
+
+- Preserved the explicitly selected Kubernetes context and persistent secondary-source errors until a successful refresh.
+- Corrected namespace-scoped Metrics Server requests and namespace-only operation without mandatory cluster-wide node/PV access.
+- Corrected CronJob timezone handling and stopped reporting confident missed schedules when timezone data is unsupported or unknown.
+- Kept selection by UID across refresh/sort and now reports when the selected object disappears.
+
 ## [1.2.0] - 2026-07-24
 
 ### Added

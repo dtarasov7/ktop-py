@@ -2,6 +2,38 @@
 
 В этом файле фиксируются заметные изменения `ktop-py.py`.
 
+## [1.3.0] - 2026-09-17
+
+### Добавлено
+
+- Read-only диагностика инцидентов для связей Service → EndpointSlice → Pod, причин деградации, таймлайна инцидента и security context workload. Сетевой экран также связывает Ingress и NetworkPolicy и явно отделяет статический анализ конфигурации от проверки connectivity.
+- CPU CFS throttling, детали OOMKilled, ошибки init-контейнеров, probe failures, eviction/ephemeral-storage findings и node pressure в Problems / Health.
+- Версионированные JSON snapshots с `schema_version: 1`, UID-aware `--diff` и offline `--replay` с переключением кадров через `F5`/`F6`.
+- Support bundle с выбором namespaces/objects, атомарной записью с mode 0600, метаданными возраста/полноты источников, явным `--include-raw` и best-effort маскированием чувствительных данных.
+- Command palette, режим Literal/Regex, просмотр состояния источников, сохраняемые presets колонок/фильтров, breadcrumbs, compact layout и корректный расчёт ширины Unicode.
+- `--namespace-only`, server-side label/field selectors для pods, ограниченный параллелизм/deadline scrape и расширенное профилирование refresh.
+
+### Изменено
+
+- Logs, describe, YAML и diagnostics выполняются в отменяемых фоновых заданиях; результат отбрасывается, если выбранный объект успел измениться.
+- Состояния метрик и secondary-источников теперь различают missing, zero, stale, forbidden, unavailable и not-yet-loaded без подстановки requests вместо live usage.
+- Refresh использует ограниченный параллелизм, TTL-кеши, индексы pods, кольцевые буферы, кеширование render/search и ранний отбор Prometheus metrics.
+- Расчёт ресурсов учитывает init containers, restartable sidecars, ephemeral containers, pod overhead, timestamps метрик и разрывы aggregate history.
+
+### Безопасность
+
+- Поиск по умолчанию буквальный; явный regex выполняется в отдельном процессе с жёстким бюджетом времени.
+- Для subprocess output, logs, входных JSON, metric history и состояния Prometheus counters введены явные ограничения размера или retention.
+- Внешний текст и невалидный UTF-8 безопасно отображаются в терминале; чтение kubeconfig больше не загружает ненужные raw credentials.
+- Metrics/RBAC guidance теперь объясняет расширенные возможности права `nodes/proxy` и рекомендует менее привилегированный путь через Metrics Server, когда он подходит.
+
+### Исправлено
+
+- Явно выбранный Kubernetes context сохраняется, а ошибки secondary-источников не исчезают до успешного refresh.
+- Исправлены namespace-scoped запросы Metrics Server и namespace-only работа без обязательного cluster-wide доступа к nodes/PV.
+- Исправлена обработка timezone CronJob; при неподдерживаемой или неизвестной зоне больше не выводится уверенный вывод о пропущенном запуске.
+- Выбор объекта сохраняется по UID после refresh/sort; исчезновение выбранного объекта теперь отображается явно.
+
 ## [1.2.0] - 2026-07-24
 
 ### Добавлено

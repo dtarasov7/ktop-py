@@ -21,24 +21,31 @@ import argparse
 import curses
 import datetime as dt
 import json
+import io
+import resource
 import locale
 import math
 import os
 import re
+import selectors
+import signal
 import shutil
 import subprocess
 import sys
 import threading
 import textwrap
 import time
+import tempfile
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+import unicodedata
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from dataclasses import dataclass, field, fields, is_dataclass, replace
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union, get_args, get_origin, get_type_hints
 
 
-VERSION = "1.2.0"
-__VERSION__ = "1.2.0"
+VERSION = "1.3.0"
+__VERSION__ = "1.3.0"
 __AUTHOR__ = "Tarasov Dmitry"
 
 MIN_ROWS = 22
@@ -54,6 +61,12 @@ METRIC_PANEL_INNER_HEIGHT = 5
 METRIC_PANEL_HEIGHT = METRIC_PANEL_INNER_HEIGHT + 2
 DEFAULT_DUMP_GRAPH_WIDTH = 10
 MAX_SEARCH_REGEX_LENGTH = 128
+DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
+DEFAULT_LOG_LIMIT_BYTES = 1024 * 1024
+DEFAULT_MAX_METRIC_SERIES = 20000
+DEFAULT_MAX_HISTORY_POINTS = 250000
+REGEX_TIMEOUT_SECONDS = 0.1
+MISSING = float("nan")
 DEFAULT_GRAPH_STYLE = os.environ.get("KTOP_PY_GRAPH_STYLE", "unicode").lower()
 if DEFAULT_GRAPH_STYLE not in ("ascii", "unicode"):
     DEFAULT_GRAPH_STYLE = "unicode"
@@ -62,7 +75,7 @@ RATE_DETAIL_COLUMNS = ["DISK R", "DISK W", "NET TX", "NET RX"]
 NODE_DEFAULT_COLUMNS = ["NAME", "STATUS", "RST", "PODS", "TAINTS", "PRESSURE", "IP", "VOLS", "DISK", "CPU", "MEM"] + RATE_DETAIL_COLUMNS
 NODE_COLUMNS = NODE_DEFAULT_COLUMNS + ["NET", "IO"]
 NAMESPACE_COLUMNS = ["NAMESPACE", "STATUS", "PODS", "READY", "RST", "FAIL", "CPU", "MEMORY"] + RATE_DETAIL_COLUMNS
-POD_COLUMNS = ["NAMESPACE", "POD", "READY", "STATUS", "RST", "AGE", "VOLS", "IP", "NODE", "CPU", "MEMORY"]
+POD_COLUMNS = ["NAMESPACE", "POD", "READY", "STATUS", "RST", "AGE", "VOLS", "IP", "NODE", "CPU", "MEMORY", "CPU REQ", "CPU LIM", "MEM REQ", "MEM LIM", "METRIC AGE"]
 CRONJOB_COLUMNS = ["NAMESPACE", "NAME", "SCHEDULE", "TZ", "SUSP", "LAST", "NEXT", "LATE", "ACTIVE", "OK", "FAIL", "P50", "P95", "P99", "STATUS", "HINT"]
 RESOURCE_PANEL_KEYS = ["resource_missing", "resource_ratios", "resource_top"]
 HEALTH_PANEL_KEYS = ["health_runtime", "health_workloads", "health_resources"]
@@ -228,6 +241,140 @@ class DataError(Exception):
     pass
 
 
+def bounded_command(cmd: Sequence[str], timeout: float, max_output: int,
+                    input_bytes: Optional[bytes] = None, cancel: Optional[threading.Event] = None) -> Tuple[int, bytes, bytes]:
+    """Read subprocess pipes within a time and combined byte budget (POSIX)."""
+    if not math.isfinite(timeout) or timeout <= 0 or max_output <= 0:
+        raise DataError("command timeout and output limit must be positive and finite")
+    started = time.monotonic()
+    if cancel is not None and cancel.is_set():
+        raise DataError("request cancelled")
+    try:
+        proc = subprocess.Popen(  # nosec B603: argv, shell disabled
+            list(cmd), stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+    except OSError as exc:
+        raise DataError("cannot start command: %s" % exc) from exc
+    output = [bytearray(), bytearray()]
+    total = 0
+    sent = 0
+    try:
+        with selectors.DefaultSelector() as selector:
+            for index, pipe in enumerate((proc.stdout, proc.stderr)):
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, selectors.EVENT_READ, index)
+            if input_bytes is not None:
+                os.set_blocking(proc.stdin.fileno(), False)
+                if input_bytes:
+                    selector.register(proc.stdin, selectors.EVENT_WRITE, 2)
+                else:
+                    proc.stdin.close()
+            while selector.get_map():
+                if cancel is not None and cancel.is_set():
+                    raise DataError("request cancelled")
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise DataError("command timed out after %.3fs" % timeout)
+                for key, _ in selector.select(min(remaining, 0.1)):
+                    if key.data == 2:
+                        try:
+                            sent += os.write(key.fd, input_bytes[sent:sent + 4096])
+                        except BrokenPipeError:
+                            sent = len(input_bytes)
+                        if sent == len(input_bytes):
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                        continue
+                    chunk = os.read(key.fd, min(65536, max_output - total + 1))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(chunk)
+                    if total > max_output:
+                        raise DataError("command output exceeds %d bytes" % max_output)
+                    output[key.data].extend(chunk)
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise DataError("command timed out after %.3fs" % timeout)
+            while proc.poll() is None:
+                if cancel is not None and cancel.is_set():
+                    raise DataError("request cancelled")
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise DataError("command timed out after %.3fs" % timeout)
+                try:
+                    proc.wait(timeout=min(remaining, 0.05))
+                except subprocess.TimeoutExpired:
+                    continue
+        return proc.returncode, bytes(output[0]), bytes(output[1])
+    finally:
+        # Also reap descendants holding inherited pipes (credential plugins).
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # The process group has already exited.
+        proc.wait()
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+
+
+def sanitize_terminal_output(text: Any) -> str:
+    return "\n".join(sanitize_terminal_text(line) for line in str(text).split("\n"))
+
+
+class TimedHistory(list):
+    """List-compatible chart values retaining their sample timestamps and gaps."""
+
+    def __init__(self, samples: Sequence[Tuple[float, float]]) -> None:
+        super().__init__(value for _, value in samples)
+        self.timestamps = [timestamp for timestamp, _ in samples]
+
+
+def metric_quality(usage: "ResourceUsage", histories: Optional[Dict[str, Sequence[float]]] = None) -> Dict[str, Dict[str, Any]]:
+    result = {}
+    now = time.time()
+    for name in USAGE_FIELDS:
+        value = getattr(usage, name)
+        history = (histories or {}).get(name, [])
+        last_good = None
+        if isinstance(history, TimedHistory):
+            last_good = next((at for at, val in reversed(list(zip(history.timestamps, history))) if math.isfinite(val)), None)
+        observed_at = usage.observed_at if math.isfinite(value) else last_good
+        state = "fresh" if math.isfinite(value) else "missing"
+        if math.isfinite(value) and value == 0:
+            state = "zero"
+        if observed_at is not None and (not math.isfinite(value) or now - observed_at > DEFAULT_REFRESH_SECONDS * 2):
+            state = "stale"
+        result[name] = {"state": state, "observed_at": observed_at,
+                        "age_seconds": max(0.0, now - observed_at) if observed_at is not None else None}
+    return result
+
+
+def quality_summary(row: Any) -> str:
+    quality = getattr(row, "metric_quality", {})
+    return " ".join("%s:%s%s" % (label, quality.get(name, {}).get("state", "missing"),
+                                  " %.0fs" % quality[name]["age_seconds"] if quality.get(name, {}).get("age_seconds") is not None else "")
+                    for name, label in (("cpu_m", "CPU"), ("mem_b", "MEM")))
+
+
+def finite_sum(values: Iterable[float]) -> float:
+    """Sum only a complete collection; missing members make the total unknown."""
+    values = list(values)
+    return sum(values) if values and all(math.isfinite(v) for v in values) else MISSING
+
+
+def measured_add(left: float, right: float) -> float:
+    if not math.isfinite(right):
+        return left
+    return (left if math.isfinite(left) else 0.0) + right
+
+
+def measured_max(left: float, right: float) -> float:
+    return max(left, right) if math.isfinite(left) else right
+
+
 @dataclass
 class CommandTiming:
     """One kubectl command measurement. / Измерение одного вызова kubectl."""
@@ -249,6 +396,9 @@ class EventInfo:
     event_type: str
     message: str
     timestamp: Optional[dt.datetime]
+    involved_uid: str = ""
+    event_uid: str = ""
+    count: int = 1
 
 
 @dataclass
@@ -268,6 +418,8 @@ class ContainerInfo:
     mem_limit_b: float
     ports: str
     mounts: int
+    kind: str = "app"
+    metric_quality: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     cpu_history: List[float] = field(default_factory=list)
     mem_history: List[float] = field(default_factory=list)
 
@@ -318,6 +470,7 @@ class NodeRow:
     fs_write_history: List[float] = field(default_factory=list)
     conditions: List[Tuple[str, str, str]] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
+    metric_quality: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -358,6 +511,7 @@ class PodRow:
     owners: List[Tuple[str, str]] = field(default_factory=list)
     owner_chain: List[Tuple[str, str]] = field(default_factory=list)
     raw: Dict[str, Any] = field(default_factory=dict)
+    metric_quality: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -561,24 +715,34 @@ class ClusterSnapshot:
     resource_quotas: List[Dict[str, Any]] = field(default_factory=list)
     limit_ranges: List[Dict[str, Any]] = field(default_factory=list)
 
+    replay_cronjobs: Optional[List[CronJobRow]] = None
+    network_resources: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    diagnostic_views: Dict[str, List[str]] = field(default_factory=dict)
+    timeline: List[Dict[str, Any]] = field(default_factory=list)
+    throttling: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    collection_selectors: Dict[str, str] = field(default_factory=dict)
+    cluster_name: str = "-"
+    cluster_scope_available: bool = True
+    source_status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
 
 @dataclass
 class ResourceUsage:
     """CPU, memory, network, and IO usage values. / Значения CPU, памяти, сети и IO."""
 
-    cpu_m: float = 0.0
-    mem_b: float = 0.0
-    net_rx_bps: float = 0.0
-    net_tx_bps: float = 0.0
-    fs_read_bps: float = 0.0
-    fs_write_bps: float = 0.0
+    cpu_m: float = MISSING
+    mem_b: float = MISSING
+    net_rx_bps: float = MISSING
+    net_tx_bps: float = MISSING
+    fs_read_bps: float = MISSING
+    fs_write_bps: float = MISSING
+    observed_at: Optional[float] = None
+    throttled_periods_ps: float = MISSING
+    cpu_periods_ps: float = MISSING
 
 
-_QUANTITY_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)([a-zA-Z]*)\s*$")
+_QUANTITY_RE = re.compile(r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)([a-zA-Z]*)\s*$")
 _DURATION_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)(ms|s|m|h)?\s*$")
-_REGEX_REPEAT_ATOM = r"(?:[+*]|\{\d+(?:,\d*)?\})"
-_REGEX_NESTED_REPEAT_RE = re.compile(r"\((?:[^()\\]|\\.)*%s(?:[^()\\]|\\.)*\)\s*%s" % (_REGEX_REPEAT_ATOM, _REGEX_REPEAT_ATOM))
-_REGEX_REPEATED_ALT_RE = re.compile(r"\((?:[^()\\]|\\.)+\|(?:[^()\\]|\\.)+\)\s*%s" % _REGEX_REPEAT_ATOM)
 
 
 def parse_duration_seconds(value: Any) -> float:
@@ -730,6 +894,8 @@ def format_mcpu(value: float) -> str:
     Returns:
         Human-readable CPU string, e.g. ``250m`` or ``2c``.
     """
+    if not math.isfinite(float(value)):
+        return "N/A"
     value = max(0.0, float(value or 0.0))
     if value >= 1000.0:
         cores = value / 1000.0
@@ -747,6 +913,8 @@ def format_bytes(value: float) -> str:
     Returns:
         Human-readable value like ``64Mi`` or ``1.5Gi``.
     """
+    if not math.isfinite(float(value)):
+        return "N/A"
     value = max(0.0, float(value or 0.0))
     units = [("Ti", 1024.0 ** 4), ("Gi", 1024.0 ** 3), ("Mi", 1024.0 ** 2), ("Ki", 1024.0)]
     for suffix, factor in units:
@@ -758,6 +926,10 @@ def format_bytes(value: float) -> str:
     return "%dB" % int(round(value))
 
 
+def format_percent_value(value: float) -> str:
+    return "%.1f%%" % value if math.isfinite(value) else "N/A"
+
+
 def ratio(value: float, total: float) -> float:
     """Clamp value/total to a display ratio. / Ограничивает value/total для отображения.
 
@@ -767,8 +939,8 @@ def ratio(value: float, total: float) -> float:
     Returns:
         Ratio in the inclusive range 0.0..1.0.
     """
-    if not total or total <= 0:
-        return 0.0
+    if not math.isfinite(value) or not math.isfinite(total) or total <= 0:
+        return MISSING
     return max(0.0, min(1.0, float(value or 0.0) / float(total)))
 
 
@@ -867,6 +1039,8 @@ def sanitize_terminal_text(text: Any) -> str:
             result.append("^" + chr(code + 64))
         elif code == 127:
             result.append("^?")
+        elif unicodedata.category(char) == "Cf":
+            result.append("\\u%04X" % code)
         elif 0x80 <= code <= 0x9F:
             result.append("\\x%02X" % code)
         else:
@@ -874,23 +1048,42 @@ def sanitize_terminal_text(text: Any) -> str:
     return "".join(result)
 
 
-def truncate(text: Any, width: int) -> str:
-    """Trim text to a terminal cell width. / Обрезает текст под ширину терминала.
+def cell_width(text: str) -> int:
+    return sum(0 if unicodedata.combining(char) or unicodedata.category(char) in ("Mn", "Me")
+               else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
 
-    Args:
-        text: Value to render.
-        width: Maximum character count.
-    Returns:
-        Sanitized and possibly ``~``-truncated string.
-    """
+
+def cell_slice(text: str, start: int, width: int) -> str:
+    result, position = [], 0
+    end = start + max(0, width)
+    for char in text:
+        size = cell_width(char)
+        if size == 0:
+            if result:
+                result.append(char)
+            continue
+        if position >= end:
+            break
+        if position >= start and position + size <= end:
+            result.append(char)
+        elif position < end and position + size > start:
+            result.append(" " * (min(end, position + size) - max(start, position)))
+        position += size
+    return "".join(result)
+
+
+def cell_pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - cell_width(text))
+
+
+def truncate(text: Any, width: int) -> str:
+    """Sanitize and clip to terminal cells, retaining combining sequences."""
     if width <= 0:
         return ""
     value = sanitize_terminal_text(text)
-    if len(value) <= width:
+    if cell_width(value) <= width:
         return value
-    if width <= 1:
-        return value[:width]
-    return value[: width - 1] + "~"
+    return cell_slice(value, 0, width - 1) + "~"
 
 
 def normalize_columns(raw: str, allowed: Sequence[str], default: Optional[Sequence[str]] = None) -> List[str]:
@@ -1030,8 +1223,9 @@ def pod_ready_counts(pod: Dict[str, Any]) -> Tuple[int, int]:
 
 
 def pod_restart_count(pod: Dict[str, Any]) -> int:
-    statuses = safe_get(pod, ["status", "containerStatuses"], []) or []
-    return sum(int(status.get("restartCount") or 0) for status in statuses)
+    return sum(int(status.get("restartCount") or 0)
+               for bucket in ("containerStatuses", "initContainerStatuses", "ephemeralContainerStatuses")
+               for status in safe_get(pod, ["status", bucket], []) or [])
 
 
 def pod_status(pod: Dict[str, Any]) -> str:
@@ -1048,7 +1242,7 @@ def pod_status(pod: Dict[str, Any]) -> str:
     phase = safe_get(pod, ["status", "phase"], "Unknown") or "Unknown"
     waiting_reason = None
     terminated_reason = None
-    for status in safe_get(pod, ["status", "containerStatuses"], []) or []:
+    for status in (safe_get(pod, ["status", "containerStatuses"], []) or []) + (safe_get(pod, ["status", "initContainerStatuses"], []) or []):
         state = status.get("state", {}) or {}
         waiting = state.get("waiting")
         terminated = state.get("terminated")
@@ -1332,20 +1526,42 @@ def owner_chain_text(chain: Sequence[Tuple[str, str]]) -> str:
     return " > ".join("%s/%s" % (kind, name) for kind, name in chain) if chain else "-"
 
 
-def sum_pod_requests(pod: Dict[str, Any]) -> Tuple[float, float]:
-    """Sum pod container requests. / Суммирует requests контейнеров pod.
+def pod_container_specs(pod: Dict[str, Any]) -> List[Tuple[Dict[str, Any], str]]:
+    result = [(container, "app") for container in safe_get(pod, ["spec", "containers"], []) or []]
+    result.extend((container, "sidecar" if container.get("restartPolicy") == "Always" else "init")
+                  for container in safe_get(pod, ["spec", "initContainers"], []) or [])
+    result.extend((container, "ephemeral") for container in safe_get(pod, ["spec", "ephemeralContainers"], []) or [])
+    return result
 
-    Args:
-        pod: Raw Kubernetes pod object.
-    Returns:
-        Tuple of CPU millicores and memory bytes.
-    """
-    cpu = 0.0
-    mem = 0.0
-    for container in safe_get(pod, ["spec", "containers"], []) or []:
-        cpu += parse_cpu_millis(container_resource(container, "requests", "cpu"))
-        mem += parse_bytes(container_resource(container, "requests", "memory"))
-    return cpu, mem
+
+def pod_resource_totals(pod: Dict[str, Any], bucket: str = "requests") -> Tuple[float, float]:
+    """Effective resources declared in spec: init stages, sidecars, pod budget, overhead."""
+    result = []
+    for resource, parser in (("cpu", parse_cpu_millis), ("memory", parse_bytes)):
+        app = sum(parser(container_resource(c, bucket, resource))
+                  for c in safe_get(pod, ["spec", "containers"], []) or [])
+        sidecars = 0.0
+        peak_init = 0.0
+        for container in safe_get(pod, ["spec", "initContainers"], []) or []:
+            request = parser(container_resource(container, bucket, resource))
+            if container.get("restartPolicy") == "Always":
+                sidecars += request
+                stage = sidecars
+            else:
+                stage = sidecars + request
+            peak_init = max(peak_init, stage)
+        effective = max(app + sidecars, peak_init)
+        pod_budget = safe_get(pod, ["spec", "resources", bucket, resource])
+        if pod_budget is not None:
+            effective = parser(pod_budget)
+        if bucket == "requests" or effective > 0:
+            effective += parser(safe_get(pod, ["spec", "overhead", resource]))
+        result.append(effective)
+    return result[0], result[1]
+
+
+def sum_pod_requests(pod: Dict[str, Any]) -> Tuple[float, float]:
+    return pod_resource_totals(pod, "requests")
 
 
 def make_container_infos(
@@ -1360,12 +1576,16 @@ def make_container_infos(
         container_metrics: Optional per-container usage mapping.
         container_histories: Optional per-container CPU/MEM history mapping.
     Returns:
-        ContainerInfo rows with aggregate single-container fallback applied.
+        App, init, sidecar and ephemeral rows with per-metric availability.
     """
     container_metrics = container_metrics or {}
     container_histories = container_histories or {}
-    statuses = {status.get("name"): status for status in safe_get(pod, ["status", "containerStatuses"], []) or []}
-    containers = safe_get(pod, ["spec", "containers"], []) or []
+    statuses = {status.get("name"): status
+                for bucket in ("containerStatuses", "initContainerStatuses", "ephemeralContainerStatuses")
+                for status in safe_get(pod, ["status", bucket], []) or []}
+    specs = pod_container_specs(pod)
+    containers = [container for container, _ in specs]
+    kinds = {container.get("name"): kind for container, kind in specs}
     # Some cAdvisor versions expose a pod-level aggregate with an empty container
     # name. For one-container pods it is the best available container value.
     # Некоторые версии cAdvisor отдают aggregate с пустым именем контейнера.
@@ -1384,10 +1604,13 @@ def make_container_infos(
         elif state.get("waiting"):
             state_name = state["waiting"].get("reason", "Waiting")
         usage = usage_with_fallback(container_metrics.get(name), aggregate_usage)
-        history = container_histories.get(name) or aggregate_history or ([], [])
+        history = container_histories.get(name)
+        if not history or not any(history):
+            history = aggregate_history or ([], [])
         result.append(
             ContainerInfo(
                 name=name,
+                kind=kinds.get(name, "app"),
                 image=container.get("image", "-"),
                 ready=bool(status.get("ready")),
                 restarts=int(status.get("restartCount") or 0),
@@ -1402,6 +1625,7 @@ def make_container_infos(
                 mounts=len(container.get("volumeMounts", []) or []),
                 cpu_history=history[0],
                 mem_history=history[1],
+                metric_quality=metric_quality(usage, {"cpu_m": history[0], "mem_b": history[1]}),
             )
         )
     return result
@@ -1471,8 +1695,9 @@ def parse_metrics_server_nodes(obj: Dict[str, Any]) -> Dict[str, ResourceUsage]:
         if not name:
             continue
         result[name] = ResourceUsage(
-            cpu_m=parse_cpu_millis(usage.get("cpu")),
-            mem_b=parse_bytes(usage.get("memory")),
+            cpu_m=parse_cpu_millis(usage["cpu"]) if "cpu" in usage else MISSING,
+            mem_b=parse_bytes(usage["memory"]) if "memory" in usage else MISSING,
+            observed_at=(parse_rfc3339(item.get("timestamp")) or dt.datetime.now(dt.timezone.utc)).timestamp(),
         )
     return result
 
@@ -1499,12 +1724,17 @@ def parse_metrics_server_pods(
             container_name = container.get("name", "")
             usage = container.get("usage", {}) or {}
             container_usage = ResourceUsage(
-                cpu_m=parse_cpu_millis(usage.get("cpu")),
-                mem_b=parse_bytes(usage.get("memory")),
+                cpu_m=parse_cpu_millis(usage["cpu"]) if "cpu" in usage else MISSING,
+                mem_b=parse_bytes(usage["memory"]) if "memory" in usage else MISSING,
+            observed_at=(parse_rfc3339(item.get("timestamp")) or dt.datetime.now(dt.timezone.utc)).timestamp(),
             )
             add_usage(pod_usage, container_usage)
             if container_name:
                 container_metrics[(namespace, pod_name, container_name)] = container_usage
+        for field_name in ("cpu_m", "mem_b"):
+            if any(not math.isfinite(getattr(container_metrics.get((namespace, pod_name, container.get("name", "")), ResourceUsage()), field_name))
+                   for container in item.get("containers", []) or []):
+                setattr(pod_usage, field_name, MISSING)
         pod_metrics[(namespace, pod_name)] = pod_usage
     return pod_metrics, container_metrics
 
@@ -1535,7 +1765,7 @@ def parse_prometheus_labels(raw: str) -> Dict[str, str]:
     return labels
 
 
-def parse_prometheus_samples(text: str) -> List[Tuple[str, Dict[str, str], float]]:
+def iter_prometheus_samples(text: str, names: Optional[Set[str]] = None) -> Iterable[Tuple[str, Dict[str, str], float]]:
     """Parse Prometheus exposition samples. / Разбирает samples Prometheus exposition format.
 
     Args:
@@ -1543,13 +1773,14 @@ def parse_prometheus_samples(text: str) -> List[Tuple[str, Dict[str, str], float
     Returns:
         Tuples of metric name, labels, and finite float value.
     """
-    samples: List[Tuple[str, Dict[str, str], float]] = []
-    for raw in text.splitlines():
+    for raw in io.StringIO(text):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         match = _PROM_SAMPLE_RE.match(line)
-        if not match:
+        if not match or (names is not None and match.group(1) not in names):
+            continue
+        if len(match.group(2) or "") > 4096:
             continue
         try:
             value = float(match.group(3))
@@ -1557,8 +1788,12 @@ def parse_prometheus_samples(text: str) -> List[Tuple[str, Dict[str, str], float
             continue
         if not math.isfinite(value):
             continue
-        samples.append((match.group(1), parse_prometheus_labels(match.group(2) or ""), value))
-    return samples
+        yield match.group(1), parse_prometheus_labels(match.group(2) or ""), value
+
+
+def parse_prometheus_samples(text: str) -> List[Tuple[str, Dict[str, str], float]]:
+    """Compatibility helper; collection consumes the iterator directly."""
+    return list(iter_prometheus_samples(text))
 
 
 def prom_label(labels: Dict[str, str], *names: str) -> str:
@@ -1638,44 +1873,26 @@ def usage_for(mapping: Dict[Any, ResourceUsage], key: Any) -> ResourceUsage:
 
 
 def usage_has_values(usage: ResourceUsage) -> bool:
-    return bool(
-        usage.cpu_m
-        or usage.mem_b
-        or usage.net_rx_bps
-        or usage.net_tx_bps
-        or usage.fs_read_bps
-        or usage.fs_write_bps
-    )
+    return any(math.isfinite(getattr(usage, name)) for name in USAGE_FIELDS)
+
+
+USAGE_FIELDS = ("cpu_m", "mem_b", "net_rx_bps", "net_tx_bps", "fs_read_bps", "fs_write_bps")
 
 
 def usage_with_fallback(primary: Optional[ResourceUsage], fallback: Optional[ResourceUsage]) -> ResourceUsage:
-    """Merge usage with zero-as-missing fallback. / Объединяет usage, считая нули отсутствующими.
-
-    Args:
-        primary: Preferred usage values.
-        fallback: Fallback usage values.
-    Returns:
-        ResourceUsage filled from primary first, fallback second.
-    """
     primary = primary or ResourceUsage()
     fallback = fallback or ResourceUsage()
-    return ResourceUsage(
-        cpu_m=primary.cpu_m or fallback.cpu_m,
-        mem_b=primary.mem_b or fallback.mem_b,
-        net_rx_bps=primary.net_rx_bps or fallback.net_rx_bps,
-        net_tx_bps=primary.net_tx_bps or fallback.net_tx_bps,
-        fs_read_bps=primary.fs_read_bps or fallback.fs_read_bps,
-        fs_write_bps=primary.fs_write_bps or fallback.fs_write_bps,
-    )
+    return ResourceUsage(**{
+        name: getattr(primary, name) if math.isfinite(getattr(primary, name)) else getattr(fallback, name)
+        for name in USAGE_FIELDS
+    }, observed_at=primary.observed_at or fallback.observed_at)
 
 
 def add_usage(target: ResourceUsage, source: ResourceUsage) -> None:
-    target.cpu_m += source.cpu_m
-    target.mem_b += source.mem_b
-    target.net_rx_bps += source.net_rx_bps
-    target.net_tx_bps += source.net_tx_bps
-    target.fs_read_bps += source.fs_read_bps
-    target.fs_write_bps += source.fs_write_bps
+    for name in USAGE_FIELDS:
+        setattr(target, name, measured_add(getattr(target, name), getattr(source, name)))
+    if source.observed_at is not None:
+        target.observed_at = min(target.observed_at or source.observed_at, source.observed_at)
 
 
 def format_bytes_per_sec(value: float) -> str:
@@ -1683,11 +1900,11 @@ def format_bytes_per_sec(value: float) -> str:
 
 
 def format_cpu_millis(value: float) -> str:
-    return "%dm" % int(round(max(0.0, float(value or 0.0))))
+    return "%dm" % int(round(max(0.0, value))) if math.isfinite(value) else "N/A"
 
 
 def format_mib(value: float) -> str:
-    return "%dMi" % int(round(max(0.0, float(value or 0.0)) / (1024.0 ** 2)))
+    return "%dMi" % int(round(max(0.0, value) / (1024.0 ** 2))) if math.isfinite(value) else "N/A"
 
 
 def format_resource_cpu(value: float) -> str:
@@ -1732,7 +1949,7 @@ def history_values(
     """
     if not history:
         return []
-    return [value for _, value in history.get(key, [])]
+    return TimedHistory(history.get(key, []))
 
 
 SPARKLINE_LEVELS = "▁▂▃▄▅▆▇█"
@@ -1921,22 +2138,18 @@ def cron_day_matches(moment: dt.datetime, spec: CronScheduleSpec) -> bool:
 
 
 def cron_schedule_reference(now: dt.datetime, timezone_name: str) -> Tuple[dt.datetime, str]:
-    """Convert reference time to a CronJob timezone. / Переводит reference time в timezone CronJob.
-
-    Args:
-        now: UTC or timezone-aware reference time.
-        timezone_name: ``spec.timeZone`` value.
-    Returns:
-        Localized time and warning text when named timezone support is unavailable.
-    """
     if now.tzinfo is None:
         now = now.replace(tzinfo=dt.timezone.utc)
     name = (timezone_name or "").strip()
     if not name:
-        return now.astimezone(), ""
+        return now, "controller timezone unknown; set spec.timeZone"
     if name.upper() in ("UTC", "ETC/UTC", "GMT", "ETC/GMT", "Z"):
         return now.astimezone(dt.timezone.utc), ""
-    return now.astimezone(), "timezone %s approximated as local time" % name
+    try:
+        from zoneinfo import ZoneInfo
+        return now.astimezone(ZoneInfo(name)), ""
+    except (ImportError, KeyError, ValueError):
+        return now, "timezone %s unavailable; use UTC or Python 3.9+ with tzdata" % name
 
 
 def cron_next_after(schedule: str, after: dt.datetime, timezone_name: str = "", max_days: int = 366) -> Tuple[Optional[dt.datetime], str]:
@@ -1954,25 +2167,36 @@ def cron_next_after(schedule: str, after: dt.datetime, timezone_name: str = "", 
         spec = parse_cron_schedule(schedule)
     except ValueError as exc:
         return None, str(exc)
+    if after.tzinfo is None:
+        after = after.replace(tzinfo=dt.timezone.utc)
     local_after, timezone_warning = cron_schedule_reference(after, timezone_name)
+    if timezone_warning:
+        return None, timezone_warning
     cursor = local_after.replace(second=0, microsecond=0) + dt.timedelta(minutes=1)
     end = cursor + dt.timedelta(days=max(1, max_days))
     minutes = sorted(spec.minutes)
     hours = sorted(spec.hours)
-    day = cursor.date()
+    day = local_after.date()
     while day <= end.date():
         base = dt.datetime.combine(day, dt.time(0, 0), tzinfo=cursor.tzinfo)
         if base.month not in spec.months or not cron_day_matches(base, spec):
             day = day + dt.timedelta(days=1)
             continue
+        candidates = []
         for hour in hours:
-            if day == cursor.date() and hour < cursor.hour:
-                continue
             for minute in minutes:
                 candidate = base.replace(hour=hour, minute=minute)
-                if candidate <= local_after or candidate < cursor or candidate > end:
-                    continue
-                return candidate.astimezone(dt.timezone.utc), timezone_warning
+                for fold in (0, 1):
+                    local = candidate.replace(fold=fold)
+                    utc = local.astimezone(dt.timezone.utc)
+                    if utc <= after.astimezone(dt.timezone.utc):
+                        continue
+                    if utc.astimezone(local_after.tzinfo).replace(tzinfo=None) != local.replace(tzinfo=None):
+                        continue
+                    if utc <= end.astimezone(dt.timezone.utc):
+                        candidates.append(utc)
+        if candidates:
+            return min(candidates), ""
         day = day + dt.timedelta(days=1)
     return None, "no matching cron time within %dd" % max_days
 
@@ -2072,6 +2296,8 @@ def build_cronjob_rows(snapshot: ClusterSnapshot, now: Optional[dt.datetime] = N
     Returns:
         Sorted CronJob diagnostic rows.
     """
+    if snapshot.replay_cronjobs is not None:
+        return snapshot.replay_cronjobs
     now = now or dt.datetime.now(dt.timezone.utc)
     runs_by_key: Dict[Tuple[str, str], List[CronJobRunRow]] = {}
     for workload in snapshot.workloads.values():
@@ -2207,6 +2433,9 @@ def make_events(events_json: Optional[Dict[str, Any]]) -> List[EventInfo]:
                 event_type=item.get("type", ""),
                 message=item.get("message", ""),
                 timestamp=timestamp,
+                involved_uid=involved.get("uid", ""),
+                event_uid=safe_get(item, ["metadata", "uid"], ""),
+                count=int(item.get("count", 1) or 1),
             )
         )
     events.sort(key=lambda event: event.timestamp or dt.datetime.min.replace(tzinfo=dt.timezone.utc), reverse=True)
@@ -2347,6 +2576,10 @@ def build_snapshot(
                 requested_mem_b=requested_mem,
                 usage_cpu_m=usage.cpu_m,
                 usage_mem_b=usage.mem_b,
+                metric_quality=metric_quality(usage, {
+                    field_name: history_values(metric_history, history_key_node(name, metric))
+                    for field_name, metric in (("cpu_m", "cpu"), ("mem_b", "mem"), ("net_rx_bps", "net_rx"), ("net_tx_bps", "net_tx"), ("fs_read_bps", "io_read"), ("fs_write_bps", "io_write"))
+                }),
                 net_rx_bps=usage.net_rx_bps,
                 net_tx_bps=usage.net_tx_bps,
                 fs_read_bps=usage.fs_read_bps,
@@ -2390,12 +2623,16 @@ def build_snapshot(
                 requested_mem_b=requested_mem,
                 usage_cpu_m=usage.cpu_m,
                 usage_mem_b=usage.mem_b,
+                metric_quality=metric_quality(usage, {
+                    field_name: history_values(metric_history, history_key_pod(namespace_name, pod_name, metric))
+                    for field_name, metric in (("cpu_m", "cpu"), ("mem_b", "mem"), ("net_rx_bps", "net_rx"), ("net_tx_bps", "net_tx"), ("fs_read_bps", "io_read"), ("fs_write_bps", "io_write"))
+                }),
                 net_rx_bps=usage.net_rx_bps,
                 net_tx_bps=usage.net_tx_bps,
                 fs_read_bps=usage.fs_read_bps,
                 fs_write_bps=usage.fs_write_bps,
-                node_alloc_cpu_m=parse_cpu_millis(node_alloc.get("cpu")),
-                node_alloc_mem_b=parse_bytes(node_alloc.get("memory")),
+                node_alloc_cpu_m=parse_cpu_millis(node_alloc["cpu"]) if "cpu" in node_alloc else MISSING,
+                node_alloc_mem_b=parse_bytes(node_alloc["memory"]) if "memory" in node_alloc else MISSING,
                 ready=ready,
                 total=total,
                 restarts=pod_restart_count(pod),
@@ -2494,11 +2731,26 @@ class KubectlClient:
             args: Parsed CLI arguments.
         """
         self.args = args
+        self.api_slots = threading.BoundedSemaphore(max(1, int(args.kubectl_parallelism)))
+        self.request_context = threading.local()
+        self.endpoint_failures: Dict[str, Tuple[int, float]] = {}
+        self.endpoint_lock = threading.Lock()
+        self.stage_seconds = {"parse": 0.0, "build": 0.0}
+        self.demand_lock = threading.Lock()
+        self.detail_demand: Optional[Set[str]] = None
+        self.context_lock = threading.Lock()
+        self.context_pinned = False
+        self.cluster_identity = (os.path.abspath(args.kubeconfig) if args.kubeconfig else os.environ.get("KUBECONFIG", "default"), args.context or "")
+        self.object_uids: Dict[Tuple[str, ...], str] = {}
+        self.history_points = 0
+        self.cache_warnings: Set[str] = set()
+        self.secondary_errors: Dict[str, List[str]] = {}
+        self.secondary_last_good: Dict[str, float] = {}
         self.kubectl = args.kubectl
         self.default_namespace = args.namespace or "default"
         self.all_namespaces = bool(getattr(args, "all_namespaces", not bool(args.namespace)))
-        self.prom_counter_previous: Dict[Tuple[str, str, Tuple[Tuple[str, str], ...]], Tuple[float, float]] = {}
-        self.metric_history: Dict[Tuple[Any, ...], List[Tuple[float, float]]] = {}
+        self.prom_counter_previous: Dict[Tuple[Any, ...], Tuple[float, float]] = OrderedDict()
+        self.metric_history: Dict[Tuple[Any, ...], deque] = OrderedDict()
         self.metrics_fresh = False
         self.prom_cached_metrics: Optional[Tuple[Dict[str, ResourceUsage], Dict[Tuple[str, str], ResourceUsage], Dict[Tuple[str, str, str], ResourceUsage], str, bool]] = None
         self.prom_last_scrape_at = 0.0
@@ -2548,6 +2800,9 @@ class KubectlClient:
                 "timing %.3fs %s %s [%s]"
                 % (item.duration_s, format_bytes(float(item.stdout_bytes)), item.command, item.status)
             )
+        lines.append("profile parse=%.3fs build=%.3fs rss_peak=%dKiB series=%d points=%d" % (
+            self.stage_seconds["parse"], self.stage_seconds["build"], resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            len(self.metric_history), self.history_points))
         return lines
 
     def base_cmd(self) -> List[str]:
@@ -2581,6 +2836,8 @@ class KubectlClient:
                 return
             namespace = self.pending_scope_value
             self.has_pending_scope = False
+        if getattr(self.args, "namespace_only", False) and not namespace:
+            return
         all_namespaces = not bool(namespace)
         if self.all_namespaces == all_namespaces and (
             all_namespaces or self.default_namespace == namespace
@@ -2590,45 +2847,78 @@ class KubectlClient:
         if namespace:
             self.default_namespace = namespace
         self.secondary_cache = {}
+        self.secondary_errors.clear()
+        self.secondary_last_good.clear()
+        self.prom_cached_metrics = None
+        self.metric_history.clear()
+        self.history_points = 0
 
     def run(self, args: Sequence[str], timeout: Optional[float] = None) -> str:
-        """Run kubectl and return stdout. / Запускает kubectl и возвращает stdout.
-
-        Args:
-            args: kubectl arguments after global flags.
-            timeout: Optional subprocess timeout in seconds.
-        Returns:
-            Command stdout.
-        Raises:
-            DataError: If kubectl is missing, times out, or exits non-zero.
-        """
+        """Run kubectl with bounded pipes and explicit text/JSON decoding."""
         cmd = self.base_cmd() + list(args)
         started_at = time.monotonic()
+        stdout = b""
         try:
-            # kubectl is executed as an argv list with shell disabled.
-            completed = subprocess.run(  # nosec B603
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                timeout=timeout or self.args.command_timeout,
-            )
-        except FileNotFoundError as exc:
-            self.record_command_timing(cmd, started_at, "", "not-found")
-            raise DataError("kubectl not found: %s" % exc) from exc
-        except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-            self.record_command_timing(cmd, started_at, stdout, "timeout")
-            raise DataError("kubectl command timed out: %s" % " ".join(cmd)) from exc
-        status = "ok" if completed.returncode == 0 else "exit-%s" % completed.returncode
-        self.record_command_timing(cmd, started_at, completed.stdout, status)
-        if completed.returncode != 0:
-            stderr = completed.stderr.strip() or completed.stdout.strip() or "exit %s" % completed.returncode
-            raise DataError("%s: %s" % (" ".join(cmd), stderr))
-        return completed.stdout
+            cancel = getattr(self.request_context, "cancel", None)
+            deadline = time.monotonic() + (timeout if timeout is not None else self.args.command_timeout)
+            while not self.api_slots.acquire(timeout=0.05):
+                if cancel is not None and cancel.is_set():
+                    raise DataError("request cancelled")
+                if time.monotonic() >= deadline:
+                    raise DataError("API concurrency wait timed out")
+            try:
+                code, stdout, stderr = bounded_command(
+                    cmd, max(0.001, deadline - time.monotonic()),
+                    getattr(self.args, "max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES), cancel=cancel,
+                )
+            finally:
+                self.api_slots.release()
+            status = "ok" if code == 0 else "exit-%s" % code
+            text = stdout.decode("utf-8", errors="backslashreplace")
+            self.record_command_timing(cmd, started_at, text, status)
+            if code:
+                detail = stderr.decode("utf-8", errors="backslashreplace").strip() or text.strip()
+                raise DataError("%s: %s" % (" ".join(cmd), detail or status))
+            # JSON is structured data: replacement bytes must not change values silently.
+            structured = "json" in args or ("--raw" in args and any(
+                str(arg).startswith("/apis/metrics.k8s.io/") for arg in args))
+            if structured:
+                try:
+                    return stdout.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise DataError("kubectl returned invalid UTF-8 JSON: %s" % exc) from exc
+            return text
+        except DataError:
+            if not stdout:
+                self.record_command_timing(cmd, started_at, "", "error")
+            raise
+
+    def pin_context(self) -> None:
+        with self.context_lock:
+            self._pin_context()
+
+    def _pin_context(self) -> None:
+        """Pin the selected context before concurrent Kubernetes requests start."""
+        if self.context_pinned:
+            return
+        if not self.args.context:
+            context = self.run(["config", "current-context"]).strip()
+            if not context:
+                raise DataError("kubeconfig has no current context; specify --context")
+            self.args.context = context
+        self.cluster_identity = (os.path.abspath(self.args.kubeconfig) if self.args.kubeconfig else os.environ.get("KUBECONFIG", "default"), self.args.context)
+        self.context_pinned = True
 
     def raw(self, path: str, timeout: Optional[float] = None) -> str:
         return self.run(["get", "--raw", path], timeout=timeout)
+
+    def parse_json(self, text: str) -> Dict[str, Any]:
+        started = time.monotonic()
+        try:
+            return json.loads(text)
+        finally:
+            with self.command_timings_lock:
+                self.stage_seconds["parse"] += time.monotonic() - started
 
     def raw_json(self, path: str, description: str, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Fetch and parse a kubectl raw JSON endpoint. / Читает и разбирает raw JSON endpoint kubectl.
@@ -2643,7 +2933,8 @@ class KubectlClient:
             DataError: If the request fails or JSON is invalid.
         """
         try:
-            return json.loads(self.raw(path, timeout=timeout))
+            text = self.raw(path, timeout=timeout)
+            return self.parse_json(text)
         except DataError:
             raise
         except json.JSONDecodeError as exc:
@@ -2663,7 +2954,7 @@ class KubectlClient:
         """
         try:
             text = self.run(list(args) + ["-o", "json"])
-            return json.loads(text)
+            return self.parse_json(text)
         except (DataError, json.JSONDecodeError) as exc:
             if required:
                 raise DataError(str(exc)) from exc
@@ -2682,7 +2973,12 @@ class KubectlClient:
         Raises:
             DataError: If a required scoped call fails.
         """
-        return self.json(["get", resource] + self.scope_args(), required=required, warnings=warnings)
+        selectors_args = []
+        if resource == "pods":
+            for flag, name in (("--selector", "label_selector"), ("--field-selector", "field_selector")):
+                if getattr(self.args, name, ""):
+                    selectors_args.extend([flag, getattr(self.args, name)])
+        return self.json(["get", resource] + self.scope_args() + selectors_args, required=required, warnings=warnings)
 
     def cluster_info(self, warnings: List[str]) -> Tuple[str, str, str]:
         """Load context, user, and server version. / Загружает context, user и версию сервера.
@@ -2697,16 +2993,15 @@ class KubectlClient:
         context = self.args.context or "-"
         user = "-"
         version = "-"
+        self.pin_context()
+        context = self.args.context
         try:
-            context = self.run(["config", "current-context"]).strip() or context
-        except DataError as exc:
+            user = self.run(["config", "view", "--minify", "-o", "jsonpath={.contexts[0].context.user}"]).strip() or "-"
+        except (DataError, json.JSONDecodeError) as exc:
             warnings.append(str(exc))
         try:
-            cfg = json.loads(self.run(["config", "view", "--minify", "--raw", "-o", "json"]))
-            contexts = safe_get(cfg, ["contexts"], []) or []
-            if contexts:
-                user = safe_get(contexts[0], ["context", "user"], "-") or "-"
-        except (DataError, json.JSONDecodeError) as exc:
+            self.cluster_name = self.run(["config", "view", "--minify", "-o", "jsonpath={.contexts[0].context.cluster}"]).strip() or "-"
+        except DataError as exc:
             warnings.append(str(exc))
         try:
             version_json = json.loads(self.run(["version", "-o", "json"]))
@@ -2725,26 +3020,76 @@ class KubectlClient:
     def prometheus_max_samples(self) -> int:
         return max(1, int(getattr(self.args, "prometheus_max_samples", DEFAULT_PROMETHEUS_MAX_SAMPLES) or DEFAULT_PROMETHEUS_MAX_SAMPLES))
 
-    def add_history_sample(self, key: Tuple[Any, ...], timestamp: float, value: float) -> None:
-        """Store a bounded metric history sample. / Сохраняет sample метрики с retention limits.
+    def history_identity(self, key: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        object_key = key[:-1]
+        if key[0] == "container":
+            object_key = ("pod", key[1], key[2])
+        return (self.cluster_identity, self.object_uids.get(object_key, "")) + key
 
-        Args:
-            key: Metric history key.
-            timestamp: Sample Unix timestamp.
-            value: Numeric sample value.
-        """
-        if not math.isfinite(float(value or 0.0)):
-            return
-        samples = self.metric_history.setdefault(key, [])
-        samples.append((timestamp, max(0.0, float(value or 0.0))))
+    def current_metric_history(self) -> Dict[Tuple[Any, ...], deque]:
+        return {key[2:]: samples for key, samples in self.metric_history.items()
+                if key == self.history_identity(key[2:])}
+
+    def sync_object_identities(self, nodes_json: Dict[str, Any], pods_json: Dict[str, Any]) -> None:
+        identities = {}
+        for node in list_items(nodes_json):
+            identities[("node", safe_get(node, ["metadata", "name"], ""))] = safe_get(node, ["metadata", "uid"], "")
+        for pod in list_items(pods_json):
+            identities[("pod", safe_get(pod, ["metadata", "namespace"], ""),
+                        safe_get(pod, ["metadata", "name"], ""))] = safe_get(pod, ["metadata", "uid"], "")
+        changed = {key for key in self.object_uids if self.object_uids.get(key) != identities.get(key)}
+        if changed:
+            # A cached scrape could belong to the previous incarnation of a pod.
+            self.prom_cached_metrics = None
+            self.prom_counter_previous.clear()
+        self.object_uids = identities
+        self.prune_metric_caches(time.time(), remove_missing=True)
+
+    def prune_metric_caches(self, timestamp: float, remove_missing: bool = False) -> None:
         cutoff = timestamp - self.prometheus_retention()
-        max_samples = self.prometheus_max_samples()
-        if len(samples) > max_samples or (samples and samples[0][0] < cutoff):
-            self.metric_history[key] = [(sample_at, sample_value) for sample_at, sample_value in samples if sample_at >= cutoff][-max_samples:]
+        for key in list(self.metric_history):
+            logical = key[2:]
+            object_key = ("pod", logical[1], logical[2]) if logical[0] == "container" else logical[:-1]
+            if key != self.history_identity(logical) or (remove_missing and logical[0] != "cluster" and object_key not in self.object_uids):
+                self.history_points -= len(self.metric_history.pop(key))
+                continue
+            old = self.metric_history[key]
+            while old and old[0][0] < cutoff:
+                old.popleft()
+                self.history_points -= 1
+            if not old:
+                del self.metric_history[key]
+        for key, (at, _) in list(self.prom_counter_previous.items()):
+            if at < cutoff:
+                del self.prom_counter_previous[key]
+        self.enforce_history_budget()
+
+    def enforce_history_budget(self) -> None:
+        max_series = getattr(self.args, "max_metric_series", DEFAULT_MAX_METRIC_SERIES)
+        max_points = getattr(self.args, "max_history_points", DEFAULT_MAX_HISTORY_POINTS)
+        while self.metric_history and (len(self.metric_history) > max_series or self.history_points > max_points):
+            self.cache_warnings.add("metric history budget reached; oldest series omitted")
+            _, samples = self.metric_history.popitem(last=False)
+            self.history_points -= len(samples)
+        while len(self.prom_counter_previous) > max_series:
+            self.cache_warnings.add("counter series budget reached; oldest series omitted")
+            self.prom_counter_previous.popitem(last=False)
+
+    def add_history_sample(self, key: Tuple[Any, ...], timestamp: float, value: float) -> None:
+        key = self.history_identity(key)
+        samples = self.metric_history.setdefault(key, deque())
+        samples.append((timestamp, max(0.0, value) if math.isfinite(value) else MISSING))
+        self.history_points += 1
+        cutoff = timestamp - self.prometheus_retention()
+        while samples and (samples[0][0] < cutoff or len(samples) > self.prometheus_max_samples()):
+            samples.popleft()
+            self.history_points -= 1
+        self.metric_history.move_to_end(key)
+        self.enforce_history_budget()
 
     def add_gauge_history_sample(self, key: Tuple[Any, ...], timestamp: float, value: float) -> None:
-        if value and value > 0:
-            self.add_history_sample(key, timestamp, value)
+        # Zero is an observation; NaN is an explicit gap.
+        self.add_history_sample(key, timestamp, value)
 
     def record_usage_history(
         self,
@@ -2761,14 +3106,14 @@ class KubectlClient:
             container_metrics: Current container metrics.
             timestamp: Sample Unix timestamp.
         """
-        cluster_cpu = 0.0
-        cluster_mem = 0.0
-        cluster_net = 0.0
-        cluster_io = 0.0
-        cluster_net_rx = 0.0
-        cluster_net_tx = 0.0
-        cluster_fs_read = 0.0
-        cluster_fs_write = 0.0
+        cluster_cpu = 0.0 if node_metrics else MISSING
+        cluster_mem = 0.0 if node_metrics else MISSING
+        cluster_net = 0.0 if node_metrics else MISSING
+        cluster_io = 0.0 if node_metrics else MISSING
+        cluster_net_rx = 0.0 if node_metrics else MISSING
+        cluster_net_tx = 0.0 if node_metrics else MISSING
+        cluster_fs_read = 0.0 if node_metrics else MISSING
+        cluster_fs_write = 0.0 if node_metrics else MISSING
         for node_name, usage in node_metrics.items():
             self.add_history_sample(history_key_node(node_name, "cpu"), timestamp, usage.cpu_m)
             self.add_gauge_history_sample(history_key_node(node_name, "mem"), timestamp, usage.mem_b)
@@ -2817,6 +3162,8 @@ class KubectlClient:
         return components or ["kubelet", "cadvisor"]
 
     def metrics_server_pods_path(self) -> str:
+        if not self.all_namespaces:
+            return "/apis/metrics.k8s.io/v1beta1/namespaces/%s/pods" % urllib.parse.quote(self.default_namespace, safe="")
         return "/apis/metrics.k8s.io/v1beta1/pods"
 
     def load_metrics_server_metrics(
@@ -2833,10 +3180,8 @@ class KubectlClient:
             DataError: If Metrics Server endpoints are unavailable or empty.
         """
         timeout = max(self.args.command_timeout, 12.0)
-        nodes_json = self.raw_json(
-            "/apis/metrics.k8s.io/v1beta1/nodes",
-            "metrics-server node metrics",
-            timeout=timeout,
+        nodes_json = {"items": []} if getattr(self.args, "namespace_only", False) else self.raw_json(
+            "/apis/metrics.k8s.io/v1beta1/nodes", "metrics-server node metrics", timeout=timeout,
         )
         pods_json = self.raw_json(
             self.metrics_server_pods_path(),
@@ -2862,9 +3207,16 @@ class KubectlClient:
         Returns:
             Per-second rate, or None until a previous sample exists or counter resets.
         """
-        key = prom_series_key(node_name, metric, labels)
+        if sum(len(str(key)) + len(str(value)) for key, value in labels.items()) > 4096:
+            self.cache_warnings.add("counter labels exceed 4096 characters; series omitted")
+            return None
+        pod_key = prom_pod_key(labels)
+        uid = self.object_uids.get(("pod",) + pod_key, "") if pod_key else self.object_uids.get(("node", node_name), "")
+        key = (self.cluster_identity, uid) + prom_series_key(node_name, metric, labels)
         previous = self.prom_counter_previous.get(key)
         self.prom_counter_previous[key] = (scraped_at, value)
+        self.prom_counter_previous.move_to_end(key)
+        self.enforce_history_budget()
         if previous is None:
             return None
         prev_at, prev_value = previous
@@ -2890,18 +3242,21 @@ class KubectlClient:
         Returns:
             Tuple of parsed sample count and usable rate count.
         """
-        samples = parse_prometheus_samples(text)
+        samples = iter_prometheus_samples(text, {"node_cpu_usage_seconds_total", "node_memory_working_set_bytes"})
+        sample_count = 0
         rate_count = 0
         node_usage = usage_for(node_metrics, node_name)
         for metric, labels, value in samples:
+            sample_count += 1
             if metric == "node_cpu_usage_seconds_total":
                 rate = self.prom_counter_rate(node_name, metric, labels, value, scraped_at)
                 if rate is not None:
-                    node_usage.cpu_m = max(node_usage.cpu_m, rate * 1000.0)
+                    node_usage.cpu_m = measured_max(node_usage.cpu_m, rate * 1000.0)
                     rate_count += 1
             elif metric == "node_memory_working_set_bytes":
-                node_usage.mem_b = max(node_usage.mem_b, value)
-        return len(samples), rate_count
+                node_usage.mem_b = measured_max(node_usage.mem_b, value)
+        node_usage.observed_at = scraped_at
+        return sample_count, rate_count
 
     def process_cadvisor_prometheus_samples(
         self,
@@ -2924,22 +3279,36 @@ class KubectlClient:
         Returns:
             Tuple of parsed sample count and usable rate count.
         """
-        samples = parse_prometheus_samples(text)
+        samples = iter_prometheus_samples(text, {
+            "container_cpu_usage_seconds_total", "container_memory_working_set_bytes",
+            "container_network_receive_bytes_total", "container_network_transmit_bytes_total",
+            "container_fs_reads_bytes_total", "container_fs_writes_bytes_total",
+            "container_cpu_cfs_periods_total", "container_cpu_cfs_throttled_periods_total"})
+        sample_count = 0
         rate_count = 0
-        root_seen = ResourceUsage()
+        root_seen = ResourceUsage(**{name: 0.0 for name in USAGE_FIELDS})
         pod_rollup = ResourceUsage()
         individual_pod_usage: Dict[Tuple[str, str], ResourceUsage] = {}
         aggregate_pod_usage: Dict[Tuple[str, str], ResourceUsage] = {}
         node_usage = usage_for(node_metrics, node_name)
 
         for metric, labels, value in samples:
+            sample_count += 1
             pod_key = prom_pod_key(labels)
             container = prom_container_name(labels)
             container_key = (pod_key[0], pod_key[1], container) if pod_key and prom_is_real_container(labels) else None
             is_root = prom_is_root_container(labels)
             is_aggregate = prom_is_pod_aggregate(labels)
 
-            if metric == "container_cpu_usage_seconds_total":
+            if metric in ("container_cpu_cfs_periods_total", "container_cpu_cfs_throttled_periods_total"):
+                if container_key:
+                    rate = self.prom_counter_rate(node_name, metric, labels, value, scraped_at)
+                    if rate is not None:
+                        target = usage_for(container_metrics, container_key)
+                        field_name = "cpu_periods_ps" if metric == "container_cpu_cfs_periods_total" else "throttled_periods_ps"
+                        setattr(target, field_name, measured_add(getattr(target, field_name), rate))
+                        target.observed_at = scraped_at
+            elif metric == "container_cpu_usage_seconds_total":
                 if not prom_cpu_is_total(labels):
                     continue
                 rate = self.prom_counter_rate(node_name, metric, labels, value, scraped_at)
@@ -2948,23 +3317,23 @@ class KubectlClient:
                 cpu_m = rate * 1000.0
                 rate_count += 1
                 if is_root:
-                    node_usage.cpu_m = max(node_usage.cpu_m, cpu_m)
+                    node_usage.cpu_m = measured_max(node_usage.cpu_m, cpu_m)
                     root_seen.cpu_m = 1.0
                 if container_key:
-                    usage_for(individual_pod_usage, pod_key).cpu_m += cpu_m
-                    usage_for(container_metrics, container_key).cpu_m += cpu_m
+                    usage_for(individual_pod_usage, pod_key).cpu_m = measured_add(usage_for(individual_pod_usage, pod_key).cpu_m, cpu_m)
+                    usage_for(container_metrics, container_key).cpu_m = measured_add(usage_for(container_metrics, container_key).cpu_m, cpu_m)
                 elif is_aggregate:
-                    usage_for(aggregate_pod_usage, pod_key).cpu_m += cpu_m
+                    usage_for(aggregate_pod_usage, pod_key).cpu_m = measured_add(usage_for(aggregate_pod_usage, pod_key).cpu_m, cpu_m)
 
             elif metric == "container_memory_working_set_bytes":
                 if is_root:
-                    node_usage.mem_b = max(node_usage.mem_b, value)
+                    node_usage.mem_b = measured_max(node_usage.mem_b, value)
                     root_seen.mem_b = 1.0
                 if container_key:
-                    usage_for(individual_pod_usage, pod_key).mem_b += value
-                    usage_for(container_metrics, container_key).mem_b += value
+                    usage_for(individual_pod_usage, pod_key).mem_b = measured_add(usage_for(individual_pod_usage, pod_key).mem_b, value)
+                    usage_for(container_metrics, container_key).mem_b = measured_add(usage_for(container_metrics, container_key).mem_b, value)
                 elif is_aggregate:
-                    usage_for(aggregate_pod_usage, pod_key).mem_b += value
+                    usage_for(aggregate_pod_usage, pod_key).mem_b = measured_add(usage_for(aggregate_pod_usage, pod_key).mem_b, value)
 
             elif metric in ("container_network_receive_bytes_total", "container_network_transmit_bytes_total"):
                 rate = self.prom_counter_rate(node_name, metric, labels, value, scraped_at)
@@ -2973,18 +3342,18 @@ class KubectlClient:
                 rate_count += 1
                 if metric == "container_network_receive_bytes_total":
                     if is_root:
-                        node_usage.net_rx_bps += rate
+                        node_usage.net_rx_bps = measured_add(node_usage.net_rx_bps, rate)
                         root_seen.net_rx_bps = 1.0
                     if pod_key:
                         usage = individual_pod_usage if container_key else aggregate_pod_usage
-                        usage_for(usage, pod_key).net_rx_bps += rate
+                        usage_for(usage, pod_key).net_rx_bps = measured_add(usage_for(usage, pod_key).net_rx_bps, rate)
                 else:
                     if is_root:
-                        node_usage.net_tx_bps += rate
+                        node_usage.net_tx_bps = measured_add(node_usage.net_tx_bps, rate)
                         root_seen.net_tx_bps = 1.0
                     if pod_key:
                         usage = individual_pod_usage if container_key else aggregate_pod_usage
-                        usage_for(usage, pod_key).net_tx_bps += rate
+                        usage_for(usage, pod_key).net_tx_bps = measured_add(usage_for(usage, pod_key).net_tx_bps, rate)
 
             elif metric in ("container_fs_reads_bytes_total", "container_fs_writes_bytes_total"):
                 rate = self.prom_counter_rate(node_name, metric, labels, value, scraped_at)
@@ -2993,22 +3362,22 @@ class KubectlClient:
                 rate_count += 1
                 if metric == "container_fs_reads_bytes_total":
                     if is_root:
-                        node_usage.fs_read_bps += rate
+                        node_usage.fs_read_bps = measured_add(node_usage.fs_read_bps, rate)
                         root_seen.fs_read_bps = 1.0
                     if container_key:
-                        usage_for(individual_pod_usage, pod_key).fs_read_bps += rate
-                        usage_for(container_metrics, container_key).fs_read_bps += rate
+                        usage_for(individual_pod_usage, pod_key).fs_read_bps = measured_add(usage_for(individual_pod_usage, pod_key).fs_read_bps, rate)
+                        usage_for(container_metrics, container_key).fs_read_bps = measured_add(usage_for(container_metrics, container_key).fs_read_bps, rate)
                     elif is_aggregate:
-                        usage_for(aggregate_pod_usage, pod_key).fs_read_bps += rate
+                        usage_for(aggregate_pod_usage, pod_key).fs_read_bps = measured_add(usage_for(aggregate_pod_usage, pod_key).fs_read_bps, rate)
                 else:
                     if is_root:
-                        node_usage.fs_write_bps += rate
+                        node_usage.fs_write_bps = measured_add(node_usage.fs_write_bps, rate)
                         root_seen.fs_write_bps = 1.0
                     if container_key:
-                        usage_for(individual_pod_usage, pod_key).fs_write_bps += rate
-                        usage_for(container_metrics, container_key).fs_write_bps += rate
+                        usage_for(individual_pod_usage, pod_key).fs_write_bps = measured_add(usage_for(individual_pod_usage, pod_key).fs_write_bps, rate)
+                        usage_for(container_metrics, container_key).fs_write_bps = measured_add(usage_for(container_metrics, container_key).fs_write_bps, rate)
                     elif is_aggregate:
-                        usage_for(aggregate_pod_usage, pod_key).fs_write_bps += rate
+                        usage_for(aggregate_pod_usage, pod_key).fs_write_bps = measured_add(usage_for(aggregate_pod_usage, pod_key).fs_write_bps, rate)
 
         # Prefer per-container sums, but fall back to cAdvisor pod aggregates when
         # individual container series are missing.
@@ -3026,19 +3395,75 @@ class KubectlClient:
         # Root cgroup series are not guaranteed on every runtime; roll up pod
         # values to node totals when root metrics were not observed.
         # Root cgroup есть не всегда; тогда собираем node totals из pod метрик.
-        if not root_seen.cpu_m and not node_usage.cpu_m:
-            node_usage.cpu_m += pod_rollup.cpu_m
-        if not root_seen.mem_b and not node_usage.mem_b:
-            node_usage.mem_b += pod_rollup.mem_b
+        if not root_seen.cpu_m and not math.isfinite(node_usage.cpu_m):
+            node_usage.cpu_m = measured_add(node_usage.cpu_m, pod_rollup.cpu_m)
+        if not root_seen.mem_b and not math.isfinite(node_usage.mem_b):
+            node_usage.mem_b = measured_add(node_usage.mem_b, pod_rollup.mem_b)
         if not root_seen.net_rx_bps:
-            node_usage.net_rx_bps += pod_rollup.net_rx_bps
+            node_usage.net_rx_bps = measured_add(node_usage.net_rx_bps, pod_rollup.net_rx_bps)
         if not root_seen.net_tx_bps:
-            node_usage.net_tx_bps += pod_rollup.net_tx_bps
+            node_usage.net_tx_bps = measured_add(node_usage.net_tx_bps, pod_rollup.net_tx_bps)
         if not root_seen.fs_read_bps:
-            node_usage.fs_read_bps += pod_rollup.fs_read_bps
+            node_usage.fs_read_bps = measured_add(node_usage.fs_read_bps, pod_rollup.fs_read_bps)
         if not root_seen.fs_write_bps:
-            node_usage.fs_write_bps += pod_rollup.fs_write_bps
-        return len(samples), rate_count
+            node_usage.fs_write_bps = measured_add(node_usage.fs_write_bps, pod_rollup.fs_write_bps)
+        node_usage.observed_at = scraped_at
+        for mapping in (pod_metrics, container_metrics):
+            for key, usage in mapping.items():
+                if key[:2] in individual_pod_usage or key[:2] in aggregate_pod_usage:
+                    usage.observed_at = scraped_at
+        return sample_count, rate_count
+
+    def endpoint_responses(self, endpoints: Iterable[Tuple[str, str, str]]) -> Iterable[Tuple[str, str, str, Optional[str]]]:
+        """Bound submitted work and retained responses; callers merge on one thread."""
+        deadline = time.monotonic() + getattr(self.args, "scrape_deadline", 30.0)
+        cancel = getattr(self.request_context, "cancel", None) or threading.Event()
+        iterator = iter(endpoints)
+
+        def fetch(item: Tuple[str, str, str]) -> Tuple[str, str, str, Optional[str]]:
+            node, component, path = item
+            self.request_context.cancel = cancel
+            try:
+                with self.endpoint_lock:
+                    failures, retry_at = self.endpoint_failures.get(path, (0, 0.0))
+                if time.monotonic() < retry_at:
+                    return node, component, "", "backoff %.0fs" % (retry_at - time.monotonic())
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or cancel.is_set():
+                    return node, component, "", "batch deadline/cancelled"
+                try:
+                    data = self.raw(path, timeout=min(remaining, self.args.command_timeout))
+                except DataError as exc:
+                    with self.endpoint_lock:
+                        self.endpoint_failures[path] = (failures + 1, time.monotonic() + min(60.0, 2.0 ** min(6, failures + 1)))
+                        # Bounded even while node names churn.
+                        while len(self.endpoint_failures) > 4096:
+                            self.endpoint_failures.pop(next(iter(self.endpoint_failures)))
+                    return node, component, "", str(exc)
+                with self.endpoint_lock:
+                    self.endpoint_failures.pop(path, None)
+                return node, component, data, None
+            finally:
+                self.request_context.cancel = None
+
+        with ThreadPoolExecutor(max_workers=self.kubectl_parallelism(), thread_name_prefix="ktop-endpoint") as executor:
+            pending = set()
+            for _ in range(self.kubectl_parallelism()):
+                item = next(iterator, None)
+                if item is not None:
+                    pending.add(executor.submit(fetch, item))
+            while pending:
+                done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                for future in done:
+                    yield future.result()
+                    if not cancel.is_set() and time.monotonic() < deadline:
+                        item = next(iterator, None)
+                        if item is not None:
+                            pending.add(executor.submit(fetch, item))
+            if cancel.is_set() or time.monotonic() >= deadline:
+                # One summary avoids expanding unstarted work into a large error list.
+                if next(iterator, None) is not None:
+                    yield "remaining endpoints", "batch", "", "deadline/cancelled; endpoints omitted"
 
     def load_prometheus_metrics(
         self,
@@ -3075,38 +3500,24 @@ class KubectlClient:
         rate_count = 0
         scrape_errors: List[str] = []
 
-        for node_name in node_names:
-            escaped_node = urllib.parse.quote(node_name, safe="")
-            if "kubelet" in components:
-                path = "/api/v1/nodes/%s/proxy/metrics" % escaped_node
-                try:
-                    samples, rates = self.process_kubelet_prometheus_samples(
-                        node_name,
-                        self.raw(path, timeout=max(self.args.command_timeout, 20.0)),
-                        time.time(),
-                        node_metrics,
-                    )
-                    sample_count += samples
-                    rate_count += rates
-                except DataError as exc:
-                    scrape_errors.append("kubelet %s: %s" % (node_name, exc))
-
-            if "cadvisor" in components:
-                path = "/api/v1/nodes/%s/proxy/metrics/cadvisor" % escaped_node
-                try:
-                    samples, rates = self.process_cadvisor_prometheus_samples(
-                        node_name,
-                        self.raw(path, timeout=max(self.args.command_timeout, 20.0)),
-                        time.time(),
-                        node_metrics,
-                        pod_metrics,
-                        container_metrics,
-                    )
-                    sample_count += samples
-                    cadvisor_sample_count += samples
-                    rate_count += rates
-                except DataError as exc:
-                    scrape_errors.append("cadvisor %s: %s" % (node_name, exc))
+        endpoints = ((name, component, "/api/v1/nodes/%s/proxy/metrics%s" % (
+            urllib.parse.quote(name, safe=""), "/cadvisor" if component == "cadvisor" else ""))
+            for name in node_names for component in components)
+        for node_name, component, data, error in self.endpoint_responses(endpoints):
+            if error:
+                scrape_errors.append("%s %s: %s" % (component, node_name, error))
+                continue
+            parsed_at = time.monotonic()
+            if component == "kubelet":
+                samples, rates = self.process_kubelet_prometheus_samples(node_name, data, time.time(), node_metrics)
+            else:
+                samples, rates = self.process_cadvisor_prometheus_samples(
+                    node_name, data, time.time(), node_metrics, pod_metrics, container_metrics)
+                cadvisor_sample_count += samples
+            with self.command_timings_lock:
+                self.stage_seconds["parse"] += time.monotonic() - parsed_at
+            sample_count += samples
+            rate_count += rates
 
         for error in scrape_errors[:3]:
             warnings.append("prometheus scrape warning: %s" % error)
@@ -3183,7 +3594,7 @@ class KubectlClient:
     def secondary_resource_specs(self) -> List[Tuple[str, str, bool, float]]:
         regular_ttl = self.secondary_refresh_interval()
         policy_ttl = max(DEFAULT_POLICY_REFRESH_SECONDS, regular_ttl)
-        return [
+        specs = [
             ("deployments", "deployments", True, regular_ttl),
             ("replicasets", "replicasets", True, regular_ttl),
             ("statefulsets", "statefulsets", True, regular_ttl),
@@ -3196,13 +3607,19 @@ class KubectlClient:
             ("pv", "pv", False, regular_ttl),
             ("pvc", "pvc", True, regular_ttl),
             ("events", "events", True, regular_ttl),
+            ("services", "services", True, regular_ttl),
+            ("endpointslices", "endpointslices.discovery.k8s.io", True, regular_ttl),
+            ("ingresses", "ingresses.networking.k8s.io", True, regular_ttl),
+            ("networkpolicies", "networkpolicies.networking.k8s.io", True, policy_ttl),
         ]
+        return [spec for spec in specs if spec[2] or not getattr(self.args, "namespace_only", False)]
 
     def cached_secondary_resources(self) -> Dict[str, Dict[str, Any]]:
-        return {
-            key: self.secondary_cache.get(key, (0.0, {"items": []}))[1]
-            for key, _, _, _ in self.secondary_resource_specs()
-        }
+        result = {key: self.secondary_cache.get(key, (0.0, {"items": []}))[1]
+                  for key, _, _, _ in self.secondary_resource_specs()}
+        for key in ("namespaces", "pv"):
+            result.setdefault(key, {"items": []})
+        return result
 
     def fetch_secondary_resource(
         self,
@@ -3224,8 +3641,12 @@ class KubectlClient:
         """Refresh slow, non-overview resources with bounded concurrency and TTL caching."""
         now = time.monotonic()
         pending: List[Tuple[str, str, bool, float]] = []
+        with self.demand_lock:
+            demand = None if self.detail_demand is None else set(self.detail_demand)
         for spec in self.secondary_resource_specs():
             key, _, _, ttl = spec
+            if demand is not None and key not in demand:
+                continue
             cached_at = self.secondary_cache.get(key, (0.0, {"items": []}))[0]
             if force or key not in self.secondary_cache or now - cached_at >= ttl:
                 pending.append(spec)
@@ -3243,8 +3664,18 @@ class KubectlClient:
                     except Exception as exc:
                         value = {"items": []}
                         local_warnings = ["secondary resource %s failed: %s" % (key, exc)]
-                    self.secondary_cache[key] = (time.monotonic(), value)
-                    warnings.extend(local_warnings)
+                    fetched_at = time.monotonic()
+                    if local_warnings:
+                        self.secondary_errors[key] = local_warnings
+                        value = self.secondary_cache.get(key, (0.0, {"items": []}))[1]
+                    else:
+                        self.secondary_errors.pop(key, None)
+                        self.secondary_last_good[key] = fetched_at
+                    self.secondary_cache[key] = (fetched_at, value)
+        for key, errors in self.secondary_errors.items():
+            last_good = self.secondary_last_good.get(key)
+            state = "unavailable" if last_good is None else "stale %.0fs" % (time.monotonic() - last_good)
+            warnings.extend("%s [%s]: %s" % (key, state, error) for error in errors)
         return self.cached_secondary_resources()
 
     def load_primary_resources(
@@ -3252,6 +3683,8 @@ class KubectlClient:
         warnings: List[str],
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Load nodes and pods concurrently; both are required for the overview."""
+        if getattr(self.args, "namespace_only", False):
+            return {"items": []}, self.json_all_namespaces_or_scoped("pods", True, warnings)
         node_warnings: List[str] = []
         pod_warnings: List[str] = []
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="ktop-primary") as executor:
@@ -3286,7 +3719,8 @@ class KubectlClient:
         node_metrics, pod_metrics, container_metrics, metrics_status, metrics_available = metrics
         context, user, version = cluster_info
         namespace_display = "(all)" if self.all_namespaces else self.default_namespace
-        return build_snapshot(
+        build_started = time.monotonic()
+        snapshot = build_snapshot(
             nodes_json,
             pods_json,
             secondary["deployments"],
@@ -3304,7 +3738,7 @@ class KubectlClient:
             node_metrics,
             pod_metrics,
             container_metrics,
-            self.metric_history,
+            self.current_metric_history(),
             context,
             user,
             version,
@@ -3314,6 +3748,43 @@ class KubectlClient:
             list(warnings),
         )
 
+        self.stage_seconds["build"] += time.monotonic() - build_started
+        snapshot.cluster_scope_available = not getattr(self.args, "namespace_only", False)
+        snapshot.network_resources = {key: list_items(secondary.get(key)) for key in NETWORK_SOURCES}
+        snapshot.collection_selectors = {key: getattr(self.args, key, "") for key in ("label_selector", "field_selector")}
+        snapshot.throttling = {"/".join(key): {
+            "fraction": json_metric(usage.throttled_periods_ps / usage.cpu_periods_ps) if usage.cpu_periods_ps > 0 and math.isfinite(usage.throttled_periods_ps) else None,
+            "observed_at": usage.observed_at,
+            "uid": self.object_uids.get(("pod", key[0], key[1]), ""),
+            "source": "cadvisor/container_cpu_cfs_*_periods_total"}
+            for key, usage in container_metrics.items()}
+        snapshot.cluster_name = getattr(self, "cluster_name", "-")
+        now = time.monotonic()
+        snapshot.source_status = {
+            key: {"state": "stale" if key in self.secondary_errors and key in self.secondary_last_good else
+                           "forbidden" if any("forbidden" in error.lower() for error in self.secondary_errors.get(key, [])) else
+                           "unavailable" if key in self.secondary_errors else
+                           "fresh" if key in self.secondary_last_good else "loading" if self.detail_demand is None or key in self.detail_demand else "not-requested",
+                  "age_seconds": now - self.secondary_last_good[key] if key in self.secondary_last_good else None,
+                  "observed_at": time.time() - (now - self.secondary_last_good[key]) if key in self.secondary_last_good else None,
+                  "errors": list(self.secondary_errors.get(key, []))}
+            for key, _, _, _ in self.secondary_resource_specs()
+        }
+        observed = [usage.observed_at for usage in node_metrics.values() if usage.observed_at is not None]
+        observed += [usage.observed_at for usage in pod_metrics.values() if usage.observed_at is not None]
+        for key, state, at in (("nodes", "fresh" if snapshot.cluster_scope_available else "not-requested", time.time()),
+                               ("pods", "fresh", time.time()),
+                               ("metrics", "loading" if metrics_status == "loading" else "fresh" if metrics_available and self.metrics_fresh else "stale" if metrics_available else "unavailable", max(observed) if observed else None)):
+            snapshot.source_status[key] = {"state": state, "observed_at": at, "age_seconds": time.time() - at if at else None}
+        for key, source in snapshot.source_status.items():
+            if source["state"] not in ("fresh", "not-requested") and not any(warning.startswith(key + " [") for warning in snapshot.warnings):
+                snapshot.warnings.append("%s [%s]" % (key, source["state"]))
+        if not snapshot.cluster_scope_available:
+            snapshot.namespaces = [self.default_namespace]
+            snapshot.namespaces_count = 1
+            snapshot.namespace_statuses = {self.default_namespace: "Unknown"}
+        return snapshot
+
     def load_snapshot_internal(
         self,
         progress_callback: Optional[Callable[[ClusterSnapshot], None]] = None,
@@ -3321,10 +3792,14 @@ class KubectlClient:
     ) -> ClusterSnapshot:
         self.apply_pending_namespace_scope()
         self.ensure_available()
+        self.pin_context()
+        self.prune_metric_caches(time.time())
         self.reset_command_timings()
+        self.stage_seconds = {"parse": 0.0, "build": 0.0}
         refresh_started_at = time.monotonic()
         warnings: List[str] = []
         nodes_json, pods_json = self.load_primary_resources(warnings)
+        self.sync_object_identities(nodes_json, pods_json)
 
         source = (self.args.metrics_source or "prometheus").lower()
         partial_metrics: Tuple[
@@ -3371,9 +3846,23 @@ class KubectlClient:
         warnings.extend(secondary_warnings)
         warnings.extend(metrics_warnings)
 
-        node_metrics, pod_metrics, container_metrics, _, metrics_available = metrics
-        if metrics_available and self.metrics_fresh:
+        raw_nodes, raw_pods, raw_containers, status, metrics_available = metrics
+        visible_nodes = {safe_get(node, ["metadata", "name"], "") for node in list_items(nodes_json)}
+        visible_pods = {(safe_get(pod, ["metadata", "namespace"], ""), safe_get(pod, ["metadata", "name"], "")) for pod in list_items(pods_json)}
+        node_metrics = {key: value for key, value in raw_nodes.items() if key in visible_nodes}
+        pod_metrics = {key: value for key, value in raw_pods.items() if key in visible_pods}
+        container_metrics = {key: value for key, value in raw_containers.items() if key[:2] in visible_pods}
+        metrics = (node_metrics, pod_metrics, container_metrics, status, metrics_available)
+        for node in list_items(nodes_json):
+            node_metrics.setdefault(safe_get(node, ["metadata", "name"], ""), ResourceUsage())
+        for pod in list_items(pods_json):
+            key = (safe_get(pod, ["metadata", "namespace"], ""), safe_get(pod, ["metadata", "name"], ""))
+            pod_metrics.setdefault(key, ResourceUsage())
+            for container, _ in pod_container_specs(pod):
+                container_metrics.setdefault(key + (container.get("name", ""),), ResourceUsage())
+        if self.metrics_fresh or not metrics_available:
             self.record_usage_history(node_metrics, pod_metrics, container_metrics, time.time())
+        warnings.extend(sorted(self.cache_warnings))
         snapshot = self.build_collected_snapshot(
             nodes_json,
             pods_json,
@@ -3382,6 +3871,10 @@ class KubectlClient:
             cluster_info,
             warnings,
         )
+        if not hasattr(self, "incident_timeline"):
+            self.incident_timeline = IncidentTimeline()
+        snapshot.timeline = self.incident_timeline.update(snapshot)
+        snapshot.diagnostic_views = diagnostic_views(snapshot)
         if getattr(self.args, "profile_refresh", False):
             snapshot.warnings.extend(
                 self.refresh_timing_lines(time.monotonic() - refresh_started_at)
@@ -3412,6 +3905,7 @@ class KubectlClient:
             DataError: If kubectl itself is unavailable.
         """
         self.ensure_available()
+        self.pin_context()
         lines = [
             "Metrics / RBAC diagnostics",
             "Mode: %s%s" % (self.args.metrics_source, "" if getattr(self.args, "metrics_source_explicit", False) else " (auto fallback enabled)"),
@@ -3439,64 +3933,33 @@ class KubectlClient:
             except DataError as exc:
                 add_result(name, "FAIL", str(exc), hint)
 
-        check_can_i(
-            "metrics.k8s.io nodes",
-            ["list", "nodes.metrics.k8s.io"],
-            "grant list on nodes.metrics.k8s.io or use --metrics-source prometheus/none",
-        )
-        check_can_i(
-            "metrics.k8s.io pods",
-            ["list", "pods.metrics.k8s.io"],
-            "grant list on pods.metrics.k8s.io or use --metrics-source prometheus/none",
-        )
-        check_can_i(
-            "kubelet node proxy",
-            ["get", "nodes/proxy"],
-            "grant get on nodes/proxy for direct prometheus scrape",
-        )
-        check_raw_json(
-            "Metrics API nodes raw",
-            "/apis/metrics.k8s.io/v1beta1/nodes",
-            "metrics-server may be missing, unhealthy, or RBAC-blocked",
-        )
-        check_raw_json(
-            "Metrics API pods raw",
-            self.metrics_server_pods_path(),
-            "metrics-server pod endpoint may be missing or RBAC-blocked",
-        )
-
-        node_names: List[str] = []
-        warnings: List[str] = []
-        nodes_json = self.json(["get", "nodes"], required=False, warnings=warnings)
-        node_names = [safe_get(node, ["metadata", "name"], "") for node in list_items(nodes_json)]
-        node_names = [name for name in node_names if name]
-        if warnings:
-            add_result("node list", "FAIL", warnings[0], "grant list nodes to test kubelet endpoints")
-        elif not node_names:
-            add_result("node list", "WARN", "no nodes returned", "check cluster access")
-
-        for endpoint, label in (("metrics", "/metrics"), ("cadvisor", "/metrics/cadvisor")):
-            ok = 0
-            first_error = ""
-            for node_name in node_names:
-                escaped_node = urllib.parse.quote(node_name, safe="")
-                try:
-                    text = self.raw("/api/v1/nodes/%s/proxy%s" % (escaped_node, label), timeout=self.diagnostic_timeout())
-                    if text.strip():
-                        ok += 1
-                    else:
-                        first_error = first_error or "%s returned empty response" % node_name
-                except DataError as exc:
-                    first_error = first_error or "%s: %s" % (node_name, exc)
-            if node_names and ok == len(node_names):
-                add_result("kubelet %s" % endpoint, "OK", "%d/%d node(s) reachable" % (ok, len(node_names)))
-            elif node_names:
-                add_result(
-                    "kubelet %s" % endpoint,
-                    "FAIL" if ok == 0 else "WARN",
-                    "%d/%d node(s) reachable; %s" % (ok, len(node_names), first_error or "some nodes failed"),
-                    "grant nodes/proxy and verify kubelet metrics endpoint",
-                )
+        namespace_only = getattr(self.args, "namespace_only", False)
+        scope = ["--all-namespaces"] if self.all_namespaces else ["-n", self.default_namespace]
+        check_can_i("pods", ["list", "pods"] + scope, "grant list pods in the selected namespace")
+        check_can_i("pod logs", ["get", "pods/log"] + scope, "grant get pods/log only if log access is needed")
+        source = self.args.metrics_source
+        if source == "metrics-server":
+            if not namespace_only:
+                check_can_i("metrics.k8s.io nodes", ["list", "nodes.metrics.k8s.io"], "allow node metrics or use --namespace-only -n NAME")
+                check_raw_json("Metrics API nodes raw", "/apis/metrics.k8s.io/v1beta1/nodes", "check metrics-server availability and node metrics permissions")
+            check_can_i("metrics.k8s.io pods", ["list", "pods.metrics.k8s.io"] + scope, "allow pod metrics in the selected scope")
+            check_raw_json("Metrics API pods raw", self.metrics_server_pods_path(), "check metrics-server availability and namespace permissions")
+        elif source in ("prometheus", "prom"):
+            lines.append("WARNING: get nodes/proxy grants powerful kubelet APIs, including container execution.")
+            lines.append("For minimal CPU/MEM access use --metrics-source metrics-server; direct scrape also provides network/IO.")
+            check_can_i("kubelet node proxy", ["get", "nodes/proxy"], "prefer metrics-server; review kubelet privileges before enabling direct scrape")
+            warnings: List[str] = []
+            nodes_json = self.json(["get", "nodes"], required=False, warnings=warnings)
+            for warning in warnings:
+                add_result("node list", "FAIL", warning)
+            endpoints = ((safe_get(node, ["metadata", "name"], ""), component,
+                          "/api/v1/nodes/%s/proxy/metrics%s" % (
+                              urllib.parse.quote(safe_get(node, ["metadata", "name"], ""), safe=""),
+                              "/cadvisor" if component == "cadvisor" else ""))
+                         for node in list_items(nodes_json) for component in self.prometheus_components())
+            for name, component, data, error in self.endpoint_responses(endpoints):
+                add_result("%s %s" % (name, component), "FAIL" if error or not data.strip() else "OK",
+                           error or ("response received" if data.strip() else "empty response"))
 
         width = max(len(result.name) for result in results) if results else 10
         for result in results:
@@ -3572,7 +4035,8 @@ class KubectlClient:
         Raises:
             DataError: If kubectl logs fails.
         """
-        args = ["logs", "-n", namespace, pod_name, "-c", container_name, "--tail", str(tail)]
+        args = ["logs", "-n", namespace, pod_name, "-c", container_name, "--tail", str(max(0, tail)),
+                "--limit-bytes", str(getattr(self.args, "log_limit_bytes", DEFAULT_LOG_LIMIT_BYTES))]
         if timestamps:
             args.append("--timestamps")
         if previous:
@@ -3642,7 +4106,7 @@ class DemoClient:
                         "name": "nightly-backup",
                         "creationTimestamp": (now - dt.timedelta(hours=12)).isoformat().replace("+00:00", "Z"),
                     },
-                    "spec": {"schedule": "*/15 * * * *", "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 1},
+                    "spec": {"schedule": "*/15 * * * *", "timeZone": "UTC", "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 1},
                     "status": {
                         "lastScheduleTime": last_cron_slot.isoformat().replace("+00:00", "Z"),
                         "lastSuccessfulTime": last_cron_slot.isoformat().replace("+00:00", "Z"),
@@ -4107,8 +4571,8 @@ def sort_nodes(nodes: List[NodeRow], column: str, ascending: bool) -> List[NodeR
             "IP": (node.internal_ip, node.name),
             "VOLS": (node.volumes_in_use, node.volumes_attached, node.name),
             "DISK": (node.alloc_storage_b, node.name),
-            "CPU": ((node.usage_cpu_m or node.requested_cpu_m), node.name),
-            "MEM": ((node.usage_mem_b or node.requested_mem_b), node.name),
+            "CPU": ((node.usage_cpu_m), node.name),
+            "MEM": ((node.usage_mem_b), node.name),
             "NET": (node.net_rx_bps + node.net_tx_bps, node.name),
             "IO": (node.fs_read_bps + node.fs_write_bps, node.name),
             "NET RX": (node.net_rx_bps, node.name),
@@ -4143,8 +4607,8 @@ def sort_pods(pods: List[PodRow], column: str, ascending: bool) -> List[PodRow]:
             "VOLS": (pod.volumes, pod.mounts, pod.name),
             "IP": (pod.ip, pod.name),
             "NODE": (pod.node, pod.name),
-            "CPU": ((pod.usage_cpu_m or pod.requested_cpu_m), pod.name),
-            "MEMORY": ((pod.usage_mem_b or pod.requested_mem_b), pod.name),
+            "CPU": ((pod.usage_cpu_m), pod.name),
+            "MEMORY": ((pod.usage_mem_b), pod.name),
         }
         return mapping.get(column, (pod.namespace, pod.name))
 
@@ -4159,6 +4623,12 @@ def aggregate_histories(histories: Sequence[Sequence[float]]) -> List[float]:
     Returns:
         Aggregated history with newest samples aligned by position.
     """
+    if any(isinstance(history, TimedHistory) for history in histories):
+        timed = [history for history in histories if isinstance(history, TimedHistory)]
+        times = sorted({at for history in timed for at in history.timestamps})
+        lookup = [dict(zip(history.timestamps, history)) for history in timed]
+        return TimedHistory([(at, finite_sum(values.get(at, MISSING) for values in lookup)
+                              if len(timed) == len(histories) else MISSING) for at in times])
     clean_histories: List[List[float]] = []
     for history in histories:
         clean = clean_metric_values(history)
@@ -4196,8 +4666,8 @@ def sort_namespaces(namespaces: List[NamespaceRow], column: str, ascending: bool
             "READY": (ready_ratio, namespace.name),
             "RST": (namespace.restarts, namespace.name),
             "FAIL": (namespace.failures, namespace.name),
-            "CPU": ((namespace.usage_cpu_m or namespace.requested_cpu_m), namespace.name),
-            "MEMORY": ((namespace.usage_mem_b or namespace.requested_mem_b), namespace.name),
+            "CPU": ((namespace.usage_cpu_m), namespace.name),
+            "MEMORY": ((namespace.usage_mem_b), namespace.name),
             "NET": (namespace.net_rx_bps + namespace.net_tx_bps, namespace.name),
             "IO": (namespace.fs_read_bps + namespace.fs_write_bps, namespace.name),
             "NET RX": (namespace.net_rx_bps, namespace.name),
@@ -4312,19 +4782,7 @@ def clean_metric_values(values: Sequence[float]) -> List[float]:
 
 
 def dump_current_value(usage: float, fallback: float, history: Sequence[float], metrics_available: bool = True) -> float:
-    """Choose current value for dump output. / Выбирает current значение для dump.
-
-    Args:
-        usage: Live usage value.
-        fallback: Request/allocatable fallback value.
-        history: Retained metric history.
-        metrics_available: Whether live metrics are connected.
-    Returns:
-        Live usage when metrics exist; fallback only when metrics are unavailable.
-    """
-    if metrics_available or history:
-        return max(0.0, float(usage or 0.0))
-    return max(0.0, float(usage or fallback or 0.0))
+    return float(usage) if metrics_available else MISSING
 
 
 def dump_sample_count(args: Optional[argparse.Namespace]) -> int:
@@ -4355,14 +4813,15 @@ def dump_metric_max(history: Sequence[float], current: float, args: Optional[arg
     """
     count = dump_sample_count(args)
     window = clean_metric_values(history)[-count:]
-    values = window + [max(0.0, float(current or 0.0))]
-    return max(values) if values else 0.0
+    values = window + ([max(0.0, current)] if math.isfinite(current) else [])
+    return max(values) if values else MISSING
 
 
 def json_metric(value: float) -> Any:
-    numeric = max(0.0, float(value or 0.0))
+    numeric = float(value)
     if not math.isfinite(numeric):
-        numeric = 0.0
+        return None
+    numeric = max(0.0, numeric)
     rounded = round(numeric, 6)
     if abs(rounded - round(rounded)) < 0.000001:
         return int(round(rounded))
@@ -4374,8 +4833,11 @@ def dump_metric_object(current: float, history: Sequence[float], args: Optional[
     result: Dict[str, Any] = {
         "current": json_metric(current),
         "max": json_metric(maximum),
+        "state": "missing" if not math.isfinite(current) else "zero" if current == 0 else "fresh",
     }
-    if total and total > 0:
+    if isinstance(history, TimedHistory):
+        result["history"] = [{"timestamp": at, "value": json_metric(value)} for at, value in zip(history.timestamps, history)]
+    if total and total > 0 and math.isfinite(current) and math.isfinite(maximum):
         result["current_pct"] = round(ratio(current, total) * 100.0, 3)
         result["max_pct"] = round(ratio(maximum, total) * 100.0, 3)
     return result
@@ -4497,6 +4959,7 @@ def dump_usage_json(
     args: Optional[argparse.Namespace],
     cpu_total: float = 0.0,
     mem_total: float = 0.0,
+    quality: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build CPU/MEM JSON usage object. / Строит JSON-объект CPU/MEM usage.
 
@@ -4511,10 +4974,15 @@ def dump_usage_json(
     Returns:
         JSON-ready dict with current and max values.
     """
-    return {
+    result = {
         "cpu_m": dump_metric_object(cpu_current, cpu_history, args, cpu_total),
         "memory_bytes": dump_metric_object(mem_current, mem_history, args, mem_total),
     }
+
+    for output_name, field_name in (("cpu_m", "cpu_m"), ("memory_bytes", "mem_b")):
+        if quality and field_name in quality:
+            result[output_name].update(quality[field_name])
+    return result
 
 
 def dump_rate_json(
@@ -4539,7 +5007,7 @@ def dump_rate_json(
     Returns:
         JSON-ready rate object.
     """
-    total_current = max(0.0, float(rx_current or 0.0)) + max(0.0, float(tx_current or 0.0))
+    total_current = rx_current + tx_current
     return {
         read_label: json_metric(rx_current),
         write_label: json_metric(tx_current),
@@ -4571,6 +5039,8 @@ def dump_container_json(container: ContainerInfo, args: Optional[argparse.Namesp
         "name": container.name,
         "image": container.image,
         "state": container.status,
+        "kind": container.kind,
+        "metric_quality": container.metric_quality,
         "ready": container.ready,
         "restarts": container.restarts,
         "ports": container.ports,
@@ -4579,7 +5049,7 @@ def dump_container_json(container: ContainerInfo, args: Optional[argparse.Namesp
             "requests": {"cpu_m": json_metric(container.cpu_request_m), "memory_bytes": json_metric(container.mem_request_b)},
             "limits": {"cpu_m": json_metric(container.cpu_limit_m), "memory_bytes": json_metric(container.mem_limit_b)},
         },
-        "usage": dump_usage_json(cpu_current, container.cpu_history, mem_current, container.mem_history, args),
+        "usage": dump_usage_json(cpu_current, container.cpu_history, mem_current, container.mem_history, args, quality=container.metric_quality),
     }
 
 
@@ -4597,7 +5067,9 @@ def dump_node_json(node: NodeRow, args: Optional[argparse.Namespace], include_ra
     cpu_current = dump_node_cpu(node, metrics_available)
     mem_current = dump_node_mem(node, metrics_available)
     result: Dict[str, Any] = {
+        "uid": safe_get(node.raw, ["metadata", "uid"], ""),
         "name": node.name,
+        "metric_quality": node.metric_quality,
         "status": node.status,
         "roles": node.roles,
         "controller": node.controller,
@@ -4626,7 +5098,7 @@ def dump_node_json(node: NodeRow, args: Optional[argparse.Namespace], include_ra
             "cpu_m": json_metric(node.requested_cpu_m),
             "memory_bytes": json_metric(node.requested_mem_b),
         },
-        "usage": dump_usage_json(cpu_current, node.cpu_history, mem_current, node.mem_history, args, node.alloc_cpu_m, node.alloc_mem_b),
+        "usage": dump_usage_json(cpu_current, node.cpu_history, mem_current, node.mem_history, args, node.alloc_cpu_m, node.alloc_mem_b, node.metric_quality),
         "network": dump_rate_json(node.net_rx_bps, node.net_tx_bps, node.net_history, args, "rx_bps", "tx_bps", "total_bps"),
         "io": dump_rate_json(node.fs_read_bps, node.fs_write_bps, node.io_history, args, "read_bps", "write_bps", "total_bps"),
         "pressures": node.pressures,
@@ -4652,7 +5124,9 @@ def dump_pod_json(pod: PodRow, args: Optional[argparse.Namespace], include_raw: 
     mem_current = dump_pod_mem(pod, metrics_available)
     result: Dict[str, Any] = {
         "namespace": pod.namespace,
+        "uid": safe_get(pod.raw, ["metadata", "uid"], ""),
         "name": pod.name,
+        "metric_quality": pod.metric_quality,
         "status": pod.status,
         "node": pod.node,
         "ip": pod.ip,
@@ -4666,7 +5140,7 @@ def dump_pod_json(pod: PodRow, args: Optional[argparse.Namespace], include_raw: 
             "requests": {"cpu_m": json_metric(pod.requested_cpu_m), "memory_bytes": json_metric(pod.requested_mem_b)},
             "node_allocatable": {"cpu_m": json_metric(pod.node_alloc_cpu_m), "memory_bytes": json_metric(pod.node_alloc_mem_b)},
         },
-        "usage": dump_usage_json(cpu_current, pod.cpu_history, mem_current, pod.mem_history, args, pod.node_alloc_cpu_m, pod.node_alloc_mem_b),
+        "usage": dump_usage_json(cpu_current, pod.cpu_history, mem_current, pod.mem_history, args, pod.node_alloc_cpu_m, pod.node_alloc_mem_b, pod.metric_quality),
         "network": dump_rate_json(pod.net_rx_bps, pod.net_tx_bps, pod.net_history, args, "rx_bps", "tx_bps", "total_bps"),
         "io": dump_rate_json(pod.fs_read_bps, pod.fs_write_bps, pod.io_history, args, "read_bps", "write_bps", "total_bps"),
         "conditions": dump_conditions_json(pod.conditions),
@@ -4717,6 +5191,525 @@ def dump_cronjob_json(row: CronJobRow, include_raw: bool) -> Dict[str, Any]:
     return result
 
 
+NETWORK_SOURCES = ('services', 'endpointslices', 'ingresses', 'networkpolicies')
+DIAGNOSTIC_LIMIT = 5000
+
+
+def diagnostic_source(snapshot: ClusterSnapshot, name: str) -> str:
+    info = snapshot.source_status.get(name, {})
+    state = info.get('state', 'unknown')
+    at = info.get('observed_at')
+    return '%s=%s age=%s' % (name, state, '%.0fs' % max(0, time.time() - at) if at else 'N/A')
+
+
+def label_selector_matches(labels: Dict[str, str], selector: Dict[str, Any]) -> bool:
+    if any(labels.get(k) != v for k, v in selector.get('matchLabels', {}).items()):
+        return False
+    for expression in selector.get('matchExpressions', []):
+        key, operator, values = expression.get('key'), expression.get('operator'), expression.get('values', [])
+        if operator == 'In' and labels.get(key) not in values:
+            return False
+        if operator == 'NotIn' and labels.get(key) in values:
+            return False
+        if operator == 'Exists' and key not in labels:
+            return False
+        if operator == 'DoesNotExist' and key in labels:
+            return False
+        if operator not in ('In', 'NotIn', 'Exists', 'DoesNotExist'):
+            return False
+    return True
+
+
+def network_lines(snapshot: ClusterSnapshot) -> List[str]:
+    lines = ['Static Service -> EndpointSlice -> Pod analysis; connectivity NOT tested.',
+             'NetworkPolicy matches describe configuration, not an allow/deny traffic verdict.']
+    lines += [diagnostic_source(snapshot, source) for source in NETWORK_SOURCES + ('pods',)]
+    resources = snapshot.network_resources
+    pod_index = {(p.namespace, p.name): p for p in snapshot.pods}
+    by_namespace: Dict[str, List[PodRow]] = {}
+    for pod in snapshot.pods:
+        by_namespace.setdefault(pod.namespace, []).append(pod)
+    slices: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for item in resources.get('endpointslices', []):
+        meta = item.get('metadata', {})
+        key = (meta.get('namespace', ''), meta.get('labels', {}).get('kubernetes.io/service-name', ''))
+        slices.setdefault(key, []).append(item)
+    pods_complete = not any(snapshot.collection_selectors.values()) and snapshot.source_status.get('pods', {}).get('state') == 'fresh'
+    slices_fresh = snapshot.source_status.get('endpointslices', {}).get('state') == 'fresh'
+    for service in resources.get('services', []):
+        meta, spec = service.get('metadata', {}), service.get('spec', {})
+        namespace, name = meta.get('namespace', ''), meta.get('name', '')
+        prefix = 'Service/%s/%s' % (namespace, name)
+        selector = spec.get('selector', {})
+        if spec.get('type') == 'ExternalName':
+            lines.append('%s ExternalName=%s; endpoints are not expected' % (prefix, spec.get('externalName', '?')))
+            continue
+        selected = [p for p in by_namespace.get(namespace, []) if selector and all(safe_get(p.raw, ['metadata', 'labels'], {}).get(k) == v for k, v in selector.items())]
+        endpoints = [endpoint for item in slices.get((namespace, name), []) for endpoint in item.get('endpoints', [])]
+        lines.append('%s selector=%s visible pods=%d endpoints=%d publishNotReadyAddresses=%s' % (
+            prefix, json.dumps(selector, sort_keys=True), len(selected), len(endpoints), spec.get('publishNotReadyAddresses', False)))
+        if not selector:
+            lines.append('  selector absent: manually managed endpoints; no selector mismatch inferred')
+        elif not selected:
+            lines.append('  selector mismatch: no matching pods' if pods_complete else '  matching pods unknown: filtered/stale/unavailable inventory')
+        if not endpoints:
+            lines.append('  empty endpoints' if slices_fresh else '  endpoints unknown: EndpointSlice inventory is not fresh')
+        for endpoint in endpoints:
+            conditions, target = endpoint.get('conditions', {}), endpoint.get('targetRef', {})
+            # nil ready is unknown; publishNotReadyAddresses can override readiness.
+            state = ','.join('%s=%s' % (key, conditions.get(key, 'unknown')) for key in ('ready', 'serving', 'terminating'))
+            lines.append('  endpoint %s %s target=%s/%s uid=%s' % (','.join(endpoint.get('addresses', [])), state,
+                         target.get('kind', '?'), target.get('name', '?'), target.get('uid', '?')))
+            pod = pod_index.get((target.get('namespace') or namespace, target.get('name')))
+            if target.get('kind') == 'Pod' and pod:
+                uid = safe_get(pod.raw, ['metadata', 'uid'], '')
+                if target.get('uid') and uid != target['uid']:
+                    lines.append('    target UID mismatch: pod was replaced')
+                elif selector and pod not in selected:
+                    lines.append('    endpoint pod does not match Service selector')
+                ready = next((c.get('status') for c in safe_get(pod.raw, ['status', 'conditions'], []) if c.get('type') == 'Ready'), 'Unknown')
+                lines.append('    Pod/%s Ready=%s (Pod status)' % (pod.name, ready))
+            elif target.get('kind') == 'Pod':
+                lines.append('    target pod absent from visible inventory; deletion is not assumed')
+            if len(lines) >= DIAGNOSTIC_LIMIT:
+                return lines[:DIAGNOSTIC_LIMIT] + ['[diagnostic row budget reached]']
+        for ingress in resources.get('ingresses', []):
+            imeta, ispec = ingress.get('metadata', {}), ingress.get('spec', {})
+            backends = [ispec.get('defaultBackend', {})]
+            backends += [path.get('backend', {}) for rule in ispec.get('rules', []) for path in rule.get('http', {}).get('paths', [])]
+            if imeta.get('namespace') == namespace and any(b.get('service', {}).get('name') == name for b in backends):
+                lines.append('  Ingress/%s class=%s -> Service/%s (configuration only)' % (imeta.get('name'), ispec.get('ingressClassName', 'unspecified'), name))
+        for policy in resources.get('networkpolicies', []):
+            pmeta, pspec = policy.get('metadata', {}), policy.get('spec', {})
+            if pmeta.get('namespace') == namespace:
+                matched = [p.name for p in selected if label_selector_matches(safe_get(p.raw, ['metadata', 'labels'], {}), pspec.get('podSelector', {}))]
+                if matched:
+                    lines.append('  NetworkPolicy/%s selects %s types=%s; rules/CNI reachability not evaluated' % (
+                        pmeta.get('name'), ','.join(matched), ','.join(pspec.get('policyTypes', ['Ingress'] + (['Egress'] if pspec.get('egress') else [])))))
+        if len(lines) >= DIAGNOSTIC_LIMIT:
+            return lines[:DIAGNOSTIC_LIMIT] + ['[diagnostic row budget reached]']
+    return lines
+
+
+def degradation_lines(snapshot: ClusterSnapshot) -> List[str]:
+    lines = ['Evidence from Pod.status, Node.conditions, Events and cAdvisor; absent evidence is not proof of health.',
+             diagnostic_source(snapshot, 'pods'), diagnostic_source(snapshot, 'events'), diagnostic_source(snapshot, 'metrics'),
+             'Ephemeral-storage bytes: N/A (no stats/summary collection); pressure/evictions below are API evidence.',
+             'CPU throttling: cAdvisor container_cpu_cfs_*_periods_total; only measured non-warming ratios are listed.']
+    for pod in snapshot.pods:
+        prefix = 'Pod/%s/%s' % (pod.namespace, pod.name)
+        status = pod.raw.get('status', {})
+        if not pod.raw.get('status'):
+            lines.append('%s Pod.status evidence unavailable (raw omitted/offline)' % prefix)
+        for bucket in ('containerStatuses', 'initContainerStatuses', 'ephemeralContainerStatuses'):
+            for container in status.get(bucket, []):
+                name = container.get('name', '?')
+                for field_name in ('state', 'lastTerminationState'):
+                    state = container.get(field_name, {})
+                    terminated = state.get('terminated')
+                    if terminated is not None and (field_name == 'lastTerminationState' or terminated.get('exitCode', 0) != 0 or terminated.get('reason') == 'OOMKilled'):
+                        lines.append('%s/%s %s.%s reason=%s exitCode=%s finishedAt=%s' % (
+                            prefix, name, bucket, field_name, terminated.get('reason', 'unknown'), terminated.get('exitCode', 'unknown'), terminated.get('finishedAt', 'unknown')))
+                    if bucket == 'initContainerStatuses' and state.get('waiting'):
+                        lines.append('%s/%s init waiting: %s [Pod.status]' % (prefix, name, state['waiting'].get('reason', 'unknown')))
+        for condition in status.get('conditions', []):
+            if condition.get('type') in ('Initialized', 'Ready', 'ContainersReady') and condition.get('status') != 'True':
+                lines.append('%s %s=%s reason=%s at=%s [Pod.status.conditions]' % (
+                    prefix, condition.get('type'), condition.get('status'), condition.get('reason', 'unknown'), condition.get('lastTransitionTime', 'unknown')))
+        message = status.get('message', '')
+        if 'ephemeral' in message.lower() or status.get('reason') == 'Evicted':
+            lines.append('%s %s: %s [Pod.status]' % (prefix, status.get('reason', ''), message))
+        for container in pod.containers:
+            metric = snapshot.throttling.get('/'.join((pod.namespace, pod.name, container.name)), {})
+            fraction = metric.get('fraction')
+            at = metric.get('observed_at')
+            fresh = at is not None and (snapshot.loaded_at.timestamp() - at) <= DEFAULT_REFRESH_SECONDS * 2
+            if fraction is not None:
+                lines.append('%s/%s CPU throttling=%.1f%% periods source=cAdvisor at=%s state=%s' % (
+                    prefix, container.name, fraction * 100,
+                    isoformat_utc(dt.datetime.fromtimestamp(at, dt.timezone.utc)) if at else 'N/A',
+                    'fresh' if fresh else 'unavailable/stale'))
+        if len(lines) >= DIAGNOSTIC_LIMIT:
+            return lines[:DIAGNOSTIC_LIMIT] + ['[diagnostic row budget reached]']
+    for event in snapshot.events:
+        if event.reason in ('Unhealthy', 'ProbeWarning', 'Evicted', 'EvictionThresholdMet') or any(word in event.message.lower() for word in ('probe failed', 'ephemeral-storage')):
+            lines.append('%s/%s %s: %s at=%s [Events; historical, not necessarily current]' % (
+                event.namespace, event.name, event.reason, event.message, isoformat_utc(event.timestamp)))
+    for node in snapshot.nodes:
+        for condition in node.conditions:
+            if condition[0] == 'DiskPressure' and condition[1] == 'True':
+                lines.append('Node/%s DiskPressure=True (disk/inodes; does not establish exact ephemeral-storage usage) [Node.conditions]' % node.name)
+    return lines[:DIAGNOSTIC_LIMIT] + (['[diagnostic row budget reached]'] if len(lines) > DIAGNOSTIC_LIMIT else [])
+
+
+def security_context_lines(snapshot: ClusterSnapshot) -> List[str]:
+    lines = ['Declared securityContext inventory; findings do not establish compromise.',
+             'Unset values are unknown/inherited; runtime defaults and ServiceAccount objects are not resolved.']
+    objects = [('Pod/%s/%s' % (p.namespace, p.name), p.raw) for p in snapshot.pods]
+    for workload in snapshot.workloads.values():
+        spec = workload.raw.get('spec', {})
+        template = safe_get(spec, ['jobTemplate', 'spec', 'template'], {}) if workload.kind == 'CronJob' else spec.get('template', {})
+        objects.append(('%s/%s/%s template' % (workload.kind, workload.namespace, workload.name), template))
+    for name, raw in objects:
+        spec = raw.get('spec', {})
+        if not spec:
+            lines.append('%s: spec unavailable (raw omitted/offline)' % name)
+            continue
+        pod_context = spec.get('securityContext', {})
+        lines.append('%s hostNetwork=%s hostPID=%s hostIPC=%s automountServiceAccountToken=%s serviceAccount=%s' % (
+            name, spec.get('hostNetwork', False), spec.get('hostPID', False), spec.get('hostIPC', False),
+            spec.get('automountServiceAccountToken', 'inherited/unknown'), spec.get('serviceAccountName', 'default')))
+        for volume in spec.get('volumes', []):
+            if 'hostPath' in volume:
+                lines.append('  volume/%s hostPath=%s type=%s' % (volume.get('name'), volume['hostPath'].get('path'), volume['hostPath'].get('type', 'unspecified')))
+        for container, kind in pod_container_specs(raw):
+            context = container.get('securityContext', {})
+            lines.append('  %s/%s privileged=%s allowPrivilegeEscalation=%s capabilities=%s' % (
+                kind, container.get('name'), context.get('privileged', False), context.get('allowPrivilegeEscalation', 'unspecified'),
+                json.dumps(context.get('capabilities', {}), sort_keys=True)))
+            lines.append('    runAsNonRoot=%s runAsUser=%s seccomp=%s [container overrides pod]' % (
+                context.get('runAsNonRoot', pod_context.get('runAsNonRoot', 'unspecified')),
+                context.get('runAsUser', pod_context.get('runAsUser', 'unspecified')),
+                json.dumps(context.get('seccompProfile', pod_context.get('seccompProfile', 'unspecified')), sort_keys=True)))
+        if len(lines) >= DIAGNOSTIC_LIMIT:
+            return lines[:DIAGNOSTIC_LIMIT] + ['[diagnostic row budget reached]']
+    return lines
+
+
+def diagnostic_views(snapshot: ClusterSnapshot) -> Dict[str, List[str]]:
+    return {'network': network_lines(snapshot), 'degradation': degradation_lines(snapshot), 'security': security_context_lines(snapshot)}
+
+
+def snapshot_objects(snapshot: ClusterSnapshot) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    result = {}
+    for kind, row in [('Node', n) for n in snapshot.nodes] + [('Pod', p) for p in snapshot.pods] + [(w.kind, w) for w in snapshot.workloads.values()]:
+        namespace = getattr(row, 'namespace', '')
+        uid = safe_get(row.raw, ['metadata', 'uid'], '')
+        identity = uid or 'name:' + row.name
+        values = {key: getattr(row, key) for key in ('status', 'ready', 'restarts', 'usage_cpu_m', 'usage_mem_b', 'desired', 'updated', 'available') if hasattr(row, key)}
+        values = {key: json_metric(value) if isinstance(value, float) else value for key, value in values.items()}
+        values['generation'] = safe_get(row.raw, ['metadata', 'generation'])
+        values['observedGeneration'] = safe_get(row.raw, ['status', 'observedGeneration'])
+        values['revision'] = safe_get(row.raw, ['metadata', 'annotations', 'deployment.kubernetes.io/revision'])
+        result[(kind, namespace, identity)] = {'kind': kind, 'namespace': namespace, 'name': row.name, 'uid': uid,
+                                                  'identity_quality': 'uid' if uid else 'name-only', 'values': values}
+    for event in snapshot.events:
+        identity = event.event_uid or '|'.join((event.involved_uid, event.kind, event.name, event.reason,
+                                                isoformat_utc(event.timestamp) or 'unknown'))
+        result[('Event', event.namespace, identity)] = {
+            'kind': 'Event',
+            'namespace': event.namespace,
+            'name': '%s:%s' % (event.name, event.reason),
+            'uid': event.event_uid,
+            'identity_quality': 'uid' if event.event_uid else 'event-key',
+            'values': {
+                'involved_uid': event.involved_uid,
+                'involved_kind': event.kind,
+                'involved_name': event.name,
+                'type': event.event_type,
+                'reason': event.reason,
+                'message': event.message,
+                'count': event.count,
+                'timestamp': isoformat_utc(event.timestamp),
+            },
+        }
+    return result
+
+
+def compare_snapshots(before: ClusterSnapshot, after: ClusterSnapshot) -> List[Dict[str, Any]]:
+    if (before.cluster_name, before.context) != (after.cluster_name, after.context):
+        raise DataError('cannot compare snapshots from different cluster/context identities')
+    if before.loaded_at > after.loaded_at:
+        raise DataError('snapshot order must be chronological: BEFORE AFTER')
+    old, new = snapshot_objects(before), snapshot_objects(after)
+    comparable_scope = (before.namespace, before.collection_selectors) == (after.namespace, after.collection_selectors)
+    changes = []
+    for key in sorted(set(old) | set(new)):
+        row = new.get(key, old.get(key))
+        if key not in old or key not in new:
+            action = 'added' if key in new else 'removed'
+            source = 'nodes' if key[0] == 'Node' else 'pods' if key[0] == 'Pod' else key[0].lower() + 's'
+            complete = comparable_scope and all(s.source_status.get(source, {}).get('state') == 'fresh' for s in (before, after))
+            changes.append(dict(row, change=action if complete else 'newly-visible' if key in new else 'no-longer-visible', at=isoformat_utc(after.loaded_at)))
+        else:
+            delta = {field: {'before': old[key]['values'].get(field), 'after': value} for field, value in new[key]['values'].items() if old[key]['values'].get(field) != value}
+            if delta:
+                changes.append(dict(row, change='changed', fields=delta, at=isoformat_utc(after.loaded_at)))
+    return changes
+
+
+class IncidentTimeline:
+    """Bounded in-memory incident observations; polling does not see every transition."""
+    def __init__(self) -> None:
+        self.entries = deque(maxlen=1000)
+        self.seen = OrderedDict()
+        self.previous: Optional[ClusterSnapshot] = None
+
+    def update(self, snapshot: ClusterSnapshot) -> List[Dict[str, Any]]:
+        if self.previous and (self.previous.context, self.previous.cluster_name) != (snapshot.context, snapshot.cluster_name):
+            self.entries.clear()
+            self.seen.clear()
+            self.previous = None
+        if self.previous and snapshot.loaded_at >= self.previous.loaded_at:
+            for change in compare_snapshots(self.previous, snapshot):
+                if change['kind'] == 'Event':
+                    continue
+                changes = change.get('fields', {})
+                interesting = {key: value for key, value in changes.items() if key in ('status', 'ready', 'restarts', 'generation', 'revision', 'updated', 'available')}
+                if change['change'] != 'changed' or interesting:
+                    self.entries.append(dict(change, fields=interesting, source='snapshot observation'))
+        for event in snapshot.events:
+            at = isoformat_utc(event.timestamp)
+            key = (event.event_uid, event.involved_uid, event.namespace, event.kind, event.name, event.reason, event.message, at, event.count)
+            if key not in self.seen:
+                self.seen[key] = True
+                self.entries.append({'at': at, 'kind': event.kind, 'namespace': event.namespace, 'name': event.name,
+                                     'uid': getattr(event, 'involved_uid', ''), 'change': event.reason, 'message': event.message, 'source': 'Events'})
+        while len(self.seen) > 4096:
+            self.seen.popitem(last=False)
+        # Keep only one previous normalized observation, never a raw snapshot chain.
+        self.previous = replace(snapshot, timeline=[], diagnostic_views={})
+        return sorted(self.entries, key=lambda entry: entry.get('at') or '')
+
+
+
+def snapshot_record(snapshot: ClusterSnapshot, include_raw: bool = False) -> Dict[str, Any]:
+    """Versioned normalized replay data; raw Kubernetes payloads are opt-in."""
+    def encode(value: Any) -> Any:
+        if isinstance(value, dt.datetime):
+            return isoformat_utc(value)
+        if isinstance(value, TimedHistory):
+            return {'timestamps': value.timestamps, 'values': [json_metric(v) for v in value]}
+        if is_dataclass(value):
+            result = {}
+            for item in fields(value):
+                child = getattr(value, item.name)
+                if item.name in ('raw', 'network_resources') and not include_raw:
+                    continue
+                result[item.name] = [encode(w) for w in child.values()] if item.name == 'workloads' else encode(child)
+            raw = getattr(value, 'raw', {})
+            if raw:
+                result['identity'] = {key: raw.get('metadata', {}).get(key) for key in ('uid', 'generation')}
+                result['identity']['observedGeneration'] = raw.get('status', {}).get('observedGeneration')
+                result['identity']['revision'] = raw.get('metadata', {}).get('annotations', {}).get('deployment.kubernetes.io/revision')
+            return result
+        if isinstance(value, dict):
+            return {key: encode(child) for key, child in value.items()}
+        if isinstance(value, (list, tuple, deque)):
+            return [encode(child) for child in value]
+        if isinstance(value, float):
+            return json_metric(value)
+        return value
+    return encode(snapshot)
+
+
+def restore_snapshot(record: Dict[str, Any]) -> ClusterSnapshot:
+    """Decode only declared dataclass fields and primitive types, never executable tags."""
+    def decode(value: Any, expected: Any) -> Any:
+        origin, arguments = get_origin(expected), get_args(expected)
+        if expected is Any:
+            return value
+        if origin is Union:
+            if value is None and type(None) in arguments:
+                return None
+            return decode(value, next(t for t in arguments if t is not type(None)))
+        if is_dataclass(expected):
+            if not isinstance(value, dict):
+                raise ValueError('expected object for ' + expected.__name__)
+            known = {item.name: item for item in fields(expected)}
+            resolved = get_type_hints(expected, globalns=globals(), localns=globals())
+            if set(value) - set(known) - {'identity'}:
+                raise ValueError('unknown snapshot field')
+            kwargs = {}
+            for key, child in value.items():
+                if key == 'identity':
+                    continue
+                if key == 'workloads':
+                    if not isinstance(child, list):
+                        raise ValueError('workloads must be an array')
+                    rows = [decode(row, WorkloadRow) for row in child]
+                    kwargs[key] = {(w.kind, w.namespace, w.name): w for w in rows}
+                else:
+                    kwargs[key] = decode(child, resolved[key])
+            identity = value.get('identity', {})
+            if not isinstance(identity, dict):
+                raise ValueError('invalid identity')
+            if 'raw' in known:
+                raw = kwargs.setdefault('raw', {})
+                if not all(isinstance(raw.get(key, {}), dict) for key in ('metadata', 'spec', 'status')):
+                    raise ValueError('invalid raw metadata/spec/status')
+                meta = raw.setdefault('metadata', {})
+                for key in ('uid', 'generation'):
+                    if identity.get(key) is not None:
+                        meta[key] = identity[key]
+                if identity.get('revision') is not None:
+                    meta.setdefault('annotations', {})['deployment.kubernetes.io/revision'] = identity['revision']
+                if identity.get('observedGeneration') is not None:
+                    raw.setdefault('status', {})['observedGeneration'] = identity['observedGeneration']
+            return expected(**kwargs)
+        if origin in (list, tuple):
+            if origin is list and arguments == (float,) and isinstance(value, dict):
+                times, vals = value.get('timestamps'), value.get('values')
+                if not isinstance(times, list) or not isinstance(vals, list) or len(times) != len(vals):
+                    raise ValueError('invalid timed history')
+                if any(type(at) not in (int, float) or not math.isfinite(at) for at in times):
+                    raise ValueError('invalid history timestamps')
+                return TimedHistory([(at, decode(v, float)) for at, v in zip(times, vals)])
+            if not isinstance(value, list):
+                raise ValueError('expected array')
+            if origin is tuple:
+                if len(value) != len(arguments):
+                    raise ValueError('invalid tuple length')
+                return tuple(decode(v, t) for v, t in zip(value, arguments))
+            return [decode(v, arguments[0]) for v in value]
+        if origin is dict:
+            if not isinstance(value, dict):
+                raise ValueError('expected mapping')
+            return {decode(k, arguments[0]): decode(v, arguments[1]) for k, v in value.items()}
+        if expected is dt.datetime:
+            parsed = parse_rfc3339(value) if isinstance(value, str) else None
+            if parsed is None:
+                raise ValueError('invalid snapshot datetime')
+            return parsed
+        if expected is float:
+            if value is None:
+                return MISSING
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError('invalid finite metric')
+            return float(value)
+        if expected in (str, bool, int) and type(value) is not expected:
+            raise ValueError('invalid ' + expected.__name__)
+        return value
+    try:
+        return decode(record, ClusterSnapshot)
+    except (TypeError, ValueError, KeyError, RecursionError, AttributeError) as exc:
+        raise DataError('invalid replay snapshot: %s' % exc) from exc
+
+
+def read_snapshot_file(path: str, max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES) -> ClusterSnapshot:
+    try:
+        with open(path, 'rb') as stream:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise DataError('snapshot exceeds --max-output-bytes')
+        payload = json.loads(data.decode('utf-8'), parse_constant=lambda value: (_ for _ in ()).throw(ValueError('non-finite JSON: ' + value)))
+        if not isinstance(payload, dict) or type(payload.get('schema_version')) is not int or payload['schema_version'] != 1:
+            raise DataError('unsupported snapshot schema_version; expected 1')
+        return restore_snapshot(payload['snapshot'])
+    except (OSError, UnicodeError, ValueError, KeyError, RecursionError) as exc:
+        raise DataError('cannot read snapshot %s: %s' % (path, exc)) from exc
+
+
+class ReplayClient:
+    """Offline snapshots; manual F5/F6 frame navigation never invokes kubectl."""
+    def __init__(self, paths: Sequence[str], max_bytes: int = DEFAULT_MAX_OUTPUT_BYTES) -> None:
+        if not paths:
+            raise DataError('replay requires snapshot paths')
+        self.paths, self.max_bytes, self.index = list(paths), max_bytes, 0
+        self.current = read_snapshot_file(self.paths[0], max_bytes)
+
+    def step(self, direction: int) -> ClusterSnapshot:
+        index = max(0, min(len(self.paths) - 1, self.index + direction))
+        snapshot = read_snapshot_file(self.paths[index], self.max_bytes)
+        self.current, self.index = snapshot, index
+        return snapshot
+
+    def load_snapshot(self) -> ClusterSnapshot:
+        return self.current
+
+    def offline(self, *args: Any, **kwargs: Any) -> Any:
+        raise DataError('offline replay: live logs/describe/YAML/diagnostics are unavailable')
+
+    get_logs = describe_object = yaml_object = diagnostics_lines = offline
+
+
+def support_bundle(snapshot: ClusterSnapshot, args: argparse.Namespace) -> Dict[str, Any]:
+    namespaces = set(getattr(args, 'bundle_namespace', []) or [])
+    objects = set()
+    for text in getattr(args, 'bundle_object', []) or []:
+        parts = text.split('/')
+        if len(parts) != 3 or not parts[0] or not parts[2]:
+            raise DataError('--bundle-object requires Kind/namespace/name (Node//name for nodes)')
+        objects.add((parts[0].lower(), parts[1], parts[2]))
+    def selected(kind: str, namespace: str, name: str) -> bool:
+        return (not namespaces or namespace in namespaces) and (not objects or (kind.lower(), namespace, name) in objects)
+    pods = [p for p in snapshot.pods if selected('Pod', p.namespace, p.name)]
+    workloads = {k: w for k, w in snapshot.workloads.items() if selected(w.kind, w.namespace, w.name)}
+    nodes = [n for n in snapshot.nodes if selected('Node', '', n.name)]
+    events = [e for e in snapshot.events if selected(e.kind, e.namespace, e.name)]
+    network = {key: [item for item in items if selected({'services': 'Service', 'endpointslices': 'EndpointSlice', 'ingresses': 'Ingress', 'networkpolicies': 'NetworkPolicy'}[key],
+                       safe_get(item, ['metadata', 'namespace'], ''), safe_get(item, ['metadata', 'name'], ''))] for key, items in snapshot.network_resources.items()}
+    scoped = bool(namespaces or objects)
+    chosen_namespaces = sorted({p.namespace for p in pods} | {w.namespace for w in workloads.values()} | namespaces)
+    chosen = replace(snapshot, pods=pods, nodes=nodes, workloads=workloads, events=events, network_resources=network,
+                     cluster_scope_available=snapshot.cluster_scope_available and not scoped,
+                     timeline=[entry for entry in snapshot.timeline if selected(entry.get('kind', ''), entry.get('namespace', ''), entry.get('name', ''))],
+                     throttling={key: value for key, value in snapshot.throttling.items() if any(key.startswith(p.namespace + '/' + p.name + '/') for p in pods)})
+    if scoped:
+        chosen = replace(chosen, namespaces=chosen_namespaces, namespaces_count=len(chosen_namespaces),
+                         namespace_statuses={k: v for k, v in snapshot.namespace_statuses.items() if k in chosen_namespaces},
+                         resource_quotas=[item for item in snapshot.resource_quotas
+                                          if safe_get(item, ['metadata', 'namespace'], '') in chosen_namespaces],
+                         limit_ranges=[item for item in snapshot.limit_ranges
+                                       if safe_get(item, ['metadata', 'namespace'], '') in chosen_namespaces],
+                         deployments_ready=0, deployments_total=0, pv_count=0, pvc_count=0,
+                         pv_capacity_b=0, pvc_capacity_b=0)
+    if scoped:
+        chosen = replace(chosen, **{item.name: [] for item in fields(chosen) if item.name.startswith('cluster_') and item.name.endswith('_history')})
+        chosen.volumes_in_use = sum(p.volumes for p in pods)
+        chosen.replay_cronjobs = None
+    chosen.diagnostic_views = diagnostic_views(chosen)
+    # Bundle selection owns pod filtering so record and visible summary agree.
+    dump_args = argparse.Namespace(**vars(args))
+    dump_args.dump_pods, dump_args.dump_pod_filter, dump_args.dump_pod_namespaces, dump_args.dump_pod_limit = 'all', '', '', 0
+    payload = json.loads(dump_snapshot_json(chosen, dump_args))
+    def redact(value: Any, parent: str = '') -> Any:
+        if isinstance(value, dict):
+            result = {}
+            for key, child in value.items():
+                lowered = key.lower()
+                if lowered in ('env', 'envfrom', 'annotations', 'data', 'stringdata', 'command', 'args'):
+                    result[key] = {} if isinstance(child, dict) else [] if isinstance(child, list) else '[REDACTED]'
+                elif any(word in lowered for word in ('password', 'credential', 'privatekey', 'clientkey', 'authorization', 'token', 'secret')):
+                    result[key] = '[REDACTED]'
+                elif lowered in ('message', 'detail', 'revision'):
+                    result[key] = '[REDACTED free text]'
+                else:
+                    result[key] = redact(child, lowered)
+            return result
+        if isinstance(value, list):
+            if parent in ('warnings', 'errors', 'degradation'):
+                return ['[REDACTED free text]'] if value else []
+            return [redact(child, parent) for child in value]
+        return value
+    payload = redact(payload)
+    payload['bundle'] = {'namespace_selection': sorted(namespaces), 'object_selection': sorted('/'.join(item) for item in objects),
+                         'created_at': isoformat_utc(dt.datetime.now(dt.timezone.utc)),
+                         'snapshot_age_seconds': max(0, time.time() - snapshot.loaded_at.timestamp()),
+                         'partial_selection': scoped, 'source_status': payload['source_status'],
+                         'redaction': 'env/envFrom, annotations, data, commands, credential keys, and event/status/warning free text removed; network/security inventory retained; no guarantee for secrets in arbitrary strings',
+                         'raw_included': bool(args.include_raw)}
+    return payload
+
+
+def write_support_bundle(path: str, payload: Dict[str, Any], max_bytes: int) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
+    if len(text.encode('utf-8')) > max_bytes:
+        raise DataError('support bundle exceeds --max-output-bytes; narrow selection')
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix='.ktop-bundle-', dir=os.path.dirname(os.path.abspath(path)))
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as stream:
+            stream.write(text)
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise DataError('cannot write support bundle: %s' % exc) from exc
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+
 def dump_snapshot_json(snapshot: ClusterSnapshot, args: Optional[argparse.Namespace] = None) -> str:
     """Render snapshot as stable JSON dump. / Рендерит snapshot как стабильный JSON dump.
 
@@ -4728,21 +5721,26 @@ def dump_snapshot_json(snapshot: ClusterSnapshot, args: Optional[argparse.Namesp
     """
     selected_pods = select_dump_pods(snapshot, args)
     include_raw = bool(getattr(args, "include_raw", False))
-    cpu_total = sum(node.alloc_cpu_m for node in snapshot.nodes)
-    mem_total = sum(node.alloc_mem_b for node in snapshot.nodes)
+    cpu_total = finite_sum(node.alloc_cpu_m for node in snapshot.nodes)
+    mem_total = finite_sum(node.alloc_mem_b for node in snapshot.nodes)
     cpu_used = sum(dump_node_cpu(node, snapshot.metrics_available) for node in snapshot.nodes)
     mem_used = sum(dump_node_mem(node, snapshot.metrics_available) for node in snapshot.nodes)
-    net_rx = sum(node.net_rx_bps for node in snapshot.nodes)
-    net_tx = sum(node.net_tx_bps for node in snapshot.nodes)
-    io_read = sum(node.fs_read_bps for node in snapshot.nodes)
-    io_write = sum(node.fs_write_bps for node in snapshot.nodes)
+    net_rx = finite_sum(node.net_rx_bps for node in snapshot.nodes)
+    net_tx = finite_sum(node.net_tx_bps for node in snapshot.nodes)
+    io_read = finite_sum(node.fs_read_bps for node in snapshot.nodes)
+    io_write = finite_sum(node.fs_write_bps for node in snapshot.nodes)
     cronjob_rows = sort_cronjobs(build_cronjob_rows(snapshot), "STATUS", True)
     payload = {
+        "schema_version": 1,
         "version": __VERSION__,
         "loaded_at": isoformat_utc(snapshot.loaded_at),
         "metrics_status": snapshot.metrics_status,
         "metrics_available": snapshot.metrics_available,
         "warnings": list(snapshot.warnings),
+        "source_status": snapshot.source_status,
+        "diagnostics": snapshot.diagnostic_views or diagnostic_views(snapshot),
+        "timeline": snapshot.timeline,
+        "cluster_scope_available": snapshot.cluster_scope_available,
         "dump": {
             "output": "json",
             "pod_mode": getattr(args, "dump_pods", "all") if args is not None else "all",
@@ -4756,6 +5754,7 @@ def dump_snapshot_json(snapshot: ClusterSnapshot, args: Optional[argparse.Namesp
             "include_raw": include_raw,
         },
         "cluster": {
+            "name": snapshot.cluster_name,
             "context": snapshot.context,
             "user": snapshot.user,
             "k8s_version": snapshot.k8s_version,
@@ -4777,7 +5776,19 @@ def dump_snapshot_json(snapshot: ClusterSnapshot, args: Optional[argparse.Namesp
         "pods": [dump_pod_json(pod, args, include_raw, snapshot.metrics_available) for pod in selected_pods],
         "cronjobs": [dump_cronjob_json(row, include_raw) for row in cronjob_rows],
     }
-    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    if not snapshot.cluster_scope_available:
+        for key in ("nodes", "pvs", "volumes_in_use", "uptime_start", "uptime", "usage", "network", "io"):
+            payload["cluster"][key] = None
+    # The replay record uses the same selection as the public dump.
+    replay_snapshot = replace(snapshot, pods=list(selected_pods), diagnostic_views=payload["diagnostics"], replay_cronjobs=cronjob_rows)
+    scope = dict(snapshot.collection_selectors)
+    for key, default in (("dump_pods", "all"), ("dump_pod_filter", ""), ("dump_pod_namespaces", ""), ("dump_pod_limit", 0)):
+        value = getattr(args, key, default)
+        if value != default:
+            scope[key] = str(value)
+    replay_snapshot.collection_selectors = scope
+    payload["snapshot"] = snapshot_record(replay_snapshot, include_raw)
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
 
 
 def dump_snapshot(snapshot: ClusterSnapshot, args: Optional[argparse.Namespace] = None) -> str:
@@ -4789,14 +5800,14 @@ def dump_snapshot(snapshot: ClusterSnapshot, args: Optional[argparse.Namespace] 
     Returns:
         Human-readable multiline text.
     """
-    cpu_total = sum(n.alloc_cpu_m for n in snapshot.nodes)
+    cpu_total = finite_sum(n.alloc_cpu_m for n in snapshot.nodes)
     cpu_used = sum(dump_node_cpu(n, snapshot.metrics_available) for n in snapshot.nodes)
-    mem_total = sum(n.alloc_mem_b for n in snapshot.nodes)
+    mem_total = finite_sum(n.alloc_mem_b for n in snapshot.nodes)
     mem_used = sum(dump_node_mem(n, snapshot.metrics_available) for n in snapshot.nodes)
-    net_rx = sum(n.net_rx_bps for n in snapshot.nodes)
-    net_tx = sum(n.net_tx_bps for n in snapshot.nodes)
-    io_read = sum(n.fs_read_bps for n in snapshot.nodes)
-    io_write = sum(n.fs_write_bps for n in snapshot.nodes)
+    net_rx = finite_sum(n.net_rx_bps for n in snapshot.nodes)
+    net_tx = finite_sum(n.net_tx_bps for n in snapshot.nodes)
+    io_read = finite_sum(n.fs_read_bps for n in snapshot.nodes)
+    io_write = finite_sum(n.fs_write_bps for n in snapshot.nodes)
     selected_pods = select_dump_pods(snapshot, args)
     lines = []
     lines.append("ktop-py.py %s" % __VERSION__)
@@ -4821,15 +5832,15 @@ def dump_snapshot(snapshot: ClusterSnapshot, args: Optional[argparse.Namespace] 
         )
     )
     lines.append(
-        "CPU: %s/%s %.1f%% max=%s | MEM: %s/%s %.1f%% max=%s"
+        'CPU: %s/%s %s max=%s | MEM: %s/%s %s max=%s'
         % (
             format_mcpu(cpu_used),
             format_mcpu(cpu_total),
-            ratio(cpu_used, cpu_total) * 100,
+            format_percent_value(ratio(cpu_used, cpu_total) * 100),
             format_mcpu(dump_metric_max(snapshot.cluster_cpu_history, cpu_used, args)),
             format_bytes(mem_used),
             format_bytes(mem_total),
-            ratio(mem_used, mem_total) * 100,
+            format_percent_value(ratio(mem_used, mem_total) * 100),
             format_bytes(dump_metric_max(snapshot.cluster_mem_history, mem_used, args)),
         )
     )
@@ -4929,12 +5940,81 @@ def dump_snapshot(snapshot: ClusterSnapshot, args: Optional[argparse.Namespace] 
                     truncate(row.hint, 60),
                 )
             )
+    lines.append("Metric quality:")
+    for row in list(snapshot.nodes) + list(selected_pods):
+        lines.append("  %s: %s" % (row.name, quality_summary(row)))
+    if not snapshot.cluster_scope_available:
+        lines[2] = "Summary: namespace-only | Nodes: N/A | PVs: N/A | cluster aggregates: N/A"
     if snapshot.warnings:
         lines.append("")
         lines.append("Warnings:")
         for warning in snapshot.warnings:
             lines.append("  - %s" % warning)
-    return "\n".join(lines)
+    return sanitize_terminal_output("\n".join(lines))
+
+
+class ViewLines(Sequence[str]):
+    """Cached wrapping index; materialize strings only on access."""
+    def __init__(self, source: Sequence[str], width: int, wrap: bool, preserve_whitespace: bool) -> None:
+        self.lines: List[str] = []
+        self.width, self.wrap = max(1, width), wrap
+        self.spans: List[Tuple[int, int, int]] = []
+        row_budget = 100000
+        for index, raw in enumerate(source):
+            line = sanitize_terminal_text(raw)
+            self.lines.append(line)
+            if len(self.spans) >= row_budget:
+                self.lines[index] = "[display row budget reached; narrow the request]"
+                self.spans.append((index, 0, len(self.lines[index])))
+                break
+            if not wrap or not line:
+                self.spans.append((index, 0, len(line)))
+                continue
+            start, cells = 0, 0
+            for end, char in enumerate(line):
+                size = cell_width(char)
+                if cells + size > self.width and end > start:
+                    self.spans.append((index, start, end))
+                    if len(self.spans) >= row_budget:
+                        self.lines.append("[display row budget reached; narrow the request]")
+                        self.spans.append((index + 1, 0, len(self.lines[-1])))
+                        return
+                    start, cells = end, 0
+                cells += size
+            self.spans.append((index, start, len(line)))
+
+    def __len__(self) -> int:
+        return len(self.spans)
+
+    def __getitem__(self, index: Any) -> Any:
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        line, start, end = self.spans[index]
+        value = self.lines[line][start:end]
+        return value if self.wrap and cell_width(value) <= self.width else truncate(value, self.width)
+
+
+def snapshot_cached(timed: bool = False) -> Callable:
+    """Bounded per-snapshot UI cache; time-sensitive diagnostics tick separately."""
+    def decorate(method: Callable) -> Callable:
+        def cached(self: Any, *args: Any, **kwargs: Any) -> Any:
+            snapshot = self.snapshot
+            if getattr(self, "derived_snapshot", None) is not snapshot:
+                self.derived_snapshot = snapshot
+                self.derived_cache = OrderedDict()
+            if not hasattr(self, "derived_cache"):
+                self.derived_cache = OrderedDict()
+            key = (method.__name__, args, tuple(sorted(kwargs.items())),
+                   tuple(sorted(getattr(self, "filters", {}).items())),
+                   tuple(getattr(self, name, ()) for name in ("node_sort", "pod_sort", "namespace_sort", "cronjob_sort")),
+                   int(time.time() / 5) if timed else 0)
+            if key not in self.derived_cache:
+                self.derived_cache[key] = method(self, *args, **kwargs)
+                while len(self.derived_cache) > 64:
+                    self.derived_cache.popitem(last=False)
+            return self.derived_cache[key]
+        return cached
+    return decorate
 
 
 class KtopApp:
@@ -5064,6 +6144,153 @@ class KtopApp:
         self.refreshing = False
         self.refresh_started_at = 0.0
         self.refresh_error = ""
+        self.pending_snapshot: Optional[ClusterSnapshot] = None
+        self.jobs_lock = threading.Lock()
+        self.jobs: Dict[str, Dict[str, Any]] = {}
+        self.job_results: Dict[str, Tuple[Any, Any, str]] = {}
+        self.job_threads: Set[str] = set()
+        self.job_serial = 0
+        self.dirty = True
+        self.refresh_again = False
+        self.last_draw_tick = -1
+        self.draw_seconds = 0.0
+        self.palette_open = False
+        self.palette_query = ""
+        self.palette_index = 0
+        self.selection_ids: Dict[str, Any] = {}
+        self.selection_rows: Dict[str, Sequence[Any]] = {}
+        if isinstance(client, KubectlClient):
+            with client.demand_lock:
+                client.detail_demand = {"namespaces", "deployments", "pv", "pvc"}
+
+    def start_job(self, lane: str, identity: Any, load: Callable[[], Any], apply: Callable[[Any], None]) -> None:
+        """Latest request wins; at most one running and one pending request per lane."""
+        with self.jobs_lock:
+            previous = self.jobs.get(lane)
+            if previous and previous["identity"] == identity:
+                return
+            if previous:
+                previous["cancel"].set()
+            self.job_serial += 1
+            job = {"id": self.job_serial, "identity": identity, "load": load, "apply": apply,
+                   "cancel": threading.Event(), "started": time.monotonic(), "running": False}
+            self.jobs[lane] = job
+            if lane not in self.job_threads:
+                self.job_threads.add(lane)
+                threading.Thread(target=self.job_worker, args=(lane,), daemon=True).start()
+        self.dirty = True
+
+    def job_worker(self, lane: str) -> None:
+        while True:
+            with self.jobs_lock:
+                job = self.jobs.get(lane)
+                if job is None or job["running"]:
+                    self.job_threads.discard(lane)
+                    return
+                job["running"] = True
+            context = getattr(self.client, "request_context", None)
+            if context is not None:
+                context.cancel = job["cancel"]
+            value, error = None, ""
+            try:
+                if not job["cancel"].is_set():
+                    value = job["load"]()
+            except Exception as exc:
+                error = str(exc)
+            finally:
+                if context is not None:
+                    context.cancel = None
+            with self.jobs_lock:
+                if self.jobs.get(lane) is job:
+                    if not job["cancel"].is_set():
+                        self.job_results[lane] = (job, value, error)
+                    self.job_threads.discard(lane)
+                    return
+
+    def cancel_action(self) -> None:
+        self.cancel_jobs()
+        if self.page == "logs":
+            self.log_stream = False
+        self.flash("Background action cancelled; streaming paused" if self.page == "logs" else "Background action cancelled")
+
+    def cancel_jobs(self, lane: Optional[str] = None) -> None:
+        with self.jobs_lock:
+            for name in list(self.jobs):
+                if lane is None or lane == name:
+                    self.jobs.pop(name)["cancel"].set()
+                    self.job_results.pop(name, None)
+        self.dirty = True
+
+    def target_identity(self, target: Optional[ObjectTarget]) -> Any:
+        if not target or not self.snapshot:
+            return None
+        kind = target.kind.lower().rstrip("s")
+        if kind == "pod":
+            row = self.find_pod((target.namespace, target.name))
+        elif kind == "node":
+            row = self.find_node(target.name)
+        else:
+            row = next((row for row in self.snapshot.workloads.values()
+                        if row.kind.lower() == kind and row.name == target.name and row.namespace == target.namespace), None)
+        return self.row_identity(row) if row is not None else None
+
+    def poll_results(self) -> None:
+        with self.snapshot_lock:
+            snapshot = self.pending_snapshot
+            self.pending_snapshot = None
+        if snapshot is not None:
+            old_target = self.target_identity(self.viewer_target)
+            old = self.find_pod(self.current_pod)
+            self.snapshot = snapshot
+            current = self.find_pod(self.current_pod)
+            if old_target is not None and self.target_identity(self.viewer_target) != old_target:
+                self.cancel_jobs("viewer")
+                self.viewer_target = None
+                self.viewer_title = "[object disappeared/replaced] " + self.viewer_title
+                self.flash("Viewer object disappeared/replaced; previous content retained", ttl=8.0)
+            if old and (not current or self.row_identity(old) != self.row_identity(current)):
+                self.cancel_jobs()
+                self.log_stream = False
+                self.flash("Current pod disappeared/replaced; select it again", ttl=8.0)
+                self.current_pod = None
+            if self.refresh_again and not self.refreshing:
+                self.last_refresh = 0
+                self.refresh_again = False
+            self.dirty = True
+        with self.jobs_lock:
+            results = list(self.job_results.items())
+            self.job_results.clear()
+        for lane, (job, value, error) in results:
+            with self.jobs_lock:
+                if self.jobs.get(lane) is not job or job["cancel"].is_set():
+                    continue
+                del self.jobs[lane]
+            if error:
+                self.flash(error, error=True, ttl=8.0)
+            else:
+                job["apply"](value)
+            self.dirty = True
+
+    def demand_details(self, page: str) -> None:
+        if not isinstance(self.client, KubectlClient):
+            return
+        groups = {
+            "network": set(NETWORK_SOURCES),
+            "degradation": {"events"},
+            "timeline": {"events", "deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "cronjobs"},
+            "security": {"deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "cronjobs"},
+            "health": {"deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "cronjobs", "events", "resourcequotas", "limitranges", "pv", "pvc"},
+            "resources": {"resourcequotas", "limitranges"},
+            "cronjobs": {"cronjobs", "jobs", "events"}, "cronjob": {"cronjobs", "jobs", "events"},
+            "owner": {"deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "cronjobs"},
+            "pod": {"events", "replicasets"}, "node": {"events"}, "namespace": {"resourcequotas", "limitranges"},
+        }.get(page, set())
+        with self.client.demand_lock:
+            new = groups - (self.client.detail_demand or set())
+            self.client.detail_demand.update(groups)
+        if new:
+            self.last_refresh = 0.0
+            self.refresh_again = True
 
     def run(self) -> None:
         """Run the TUI event loop. / Запускает TUI event loop.
@@ -5073,25 +6300,44 @@ class KtopApp:
         """
         self.setup_curses()
         self.refresh_snapshot(force=False)
-        while True:
-            now = time.time()
-            if now - self.last_refresh >= self.args.refresh_interval and not self.editing_filter:
-                self.refresh_snapshot(force=False)
-            if self.page == "logs" and self.log_stream and now - self.last_log_refresh >= max(2.0, self.args.refresh_interval):
-                self.load_logs()
-            self.draw()
-            try:
-                ch = self.stdscr.get_wch()
-            except curses.error:
-                ch = None
-            if ch is not None and self.handle_key(ch):
-                break
+        try:
+            while True:
+                self.poll_results()
+                now = time.time()
+                if now - self.last_refresh >= self.args.refresh_interval and not self.editing_filter:
+                    self.refresh_snapshot(force=False)
+                if self.page == "logs" and self.log_stream and now - self.last_log_refresh >= max(2.0, self.args.refresh_interval):
+                    self.load_logs()
+                tick = int(now)
+                if self.dirty or (tick != self.last_draw_tick and tick % 5 == 0 and not self.palette_open):
+                    started = time.monotonic()
+                    self.draw()
+                    self.draw_seconds = time.monotonic() - started
+                    self.dirty = False
+                    self.last_draw_tick = tick
+                elif tick != self.last_draw_tick:
+                    self.draw_clock_tick()
+                    self.last_draw_tick = tick
+                if self.refresh_again and not self.refreshing:
+                    self.last_refresh = 0
+                    self.refresh_again = False
+                try:
+                    ch = self.stdscr.get_wch()
+                except curses.error:
+                    ch = None
+                if ch is not None:
+                    self.dirty = True
+                    if self.handle_key(ch):
+                        break
+        finally:
+            self.cancel_jobs()
+
 
     def setup_curses(self) -> None:
         """Configure curses colors and input. / Настраивает цвета и ввод curses."""
         curses.curs_set(0)
         self.stdscr.keypad(True)
-        self.stdscr.timeout(200)
+        self.stdscr.timeout(50)
         if curses.has_colors():
             curses.start_color()
             curses.use_default_colors()
@@ -5151,7 +6397,7 @@ class KtopApp:
         try:
             def publish_snapshot(snapshot: ClusterSnapshot) -> None:
                 with self.snapshot_lock:
-                    self.snapshot = snapshot
+                    self.pending_snapshot = snapshot
 
             progressive_loader = getattr(self.client, "load_snapshot_progressive", None)
             if callable(progressive_loader):
@@ -5174,6 +6420,7 @@ class KtopApp:
                 self.refreshing = False
 
     def flash(self, text: str, error: bool = False, ttl: float = 3.0) -> None:
+        self.dirty = True
         self.message = text
         self.message_until = time.time() + ttl
         if error:
@@ -5183,24 +6430,27 @@ class KtopApp:
         """Draw the current page. / Рисует текущую страницу."""
         self.stdscr.erase()
         height, width = self.stdscr.getmaxyx()
-        if height < MIN_ROWS or width < 80:
-            self.add(0, 0, "Terminal too small: %dx%d, need at least 80x%d" % (width, height, MIN_ROWS), self.colors.get("red", 0))
+        if self.palette_open:
+            self.draw_palette()
             self.stdscr.refresh()
             return
-        if self.page == "logs" and self.log_plain:
-            self.draw_logs_plain(0, 0, height, width)
+        if height < 6 or width < 24:
+            self.add(0, 0, "ktop: need 24x6; q quit", 0, width)
             self.stdscr.refresh()
             return
-        if self.page == "viewer" and self.viewer_plain:
-            self.draw_viewer_plain(0, 0, height, width)
-            self.stdscr.refresh()
-            return
-        header_h = 1
+        header_h = min(max(2, 1 + len(self.source_strip(width))), max(2, height // 3))
+        self.header_height = header_h
         footer_h = 2
         content_y = header_h
         content_h = height - header_h - footer_h
         self.draw_header(0, 0, header_h, width)
-        if self.page == "overview":
+        if width < 80 or height < 30:
+            self.draw_compact(content_y, content_h, width)
+        elif self.page in ("network", "degradation", "timeline", "security"):
+            self.draw_text_page(content_y, 0, content_h, width, self.page, self.incident_lines(self.page), self.page)
+        elif self.page == "sources":
+            self.draw_text_page(content_y, 0, content_h, width, "Sources (timestamps UTC)", self.source_lines(), "sources")
+        elif self.page == "overview":
             self.draw_overview(content_y, 0, content_h, width)
         elif self.page == "node":
             self.draw_node_detail(content_y, 0, content_h, width)
@@ -5213,9 +6463,9 @@ class KtopApp:
         elif self.page == "cronjob":
             self.draw_cronjob_detail(content_y, 0, content_h, width)
         elif self.page == "logs":
-            self.draw_logs(content_y, 0, content_h, width)
+            (self.draw_logs_plain if self.log_plain else self.draw_logs)(content_y, 0, content_h, width)
         elif self.page == "viewer":
-            self.draw_viewer(content_y, 0, content_h, width)
+            (self.draw_viewer_plain if self.viewer_plain else self.draw_viewer)(content_y, 0, content_h, width)
         elif self.page == "health":
             self.draw_health(content_y, 0, content_h, width)
         elif self.page == "resources":
@@ -5232,27 +6482,122 @@ class KtopApp:
         self.draw_footer(height - footer_h, 0, footer_h, width)
         self.stdscr.refresh()
 
+    def draw_clock_tick(self) -> None:
+        if self.palette_open:
+            return
+        height, width = self.stdscr.getmaxyx()
+        if height < 6 or width < 24:
+            return
+        header_h = min(max(2, 1 + len(self.source_strip(width))), max(2, height // 3))
+        header_h = getattr(self, "header_height", header_h)
+        # Clear only changing chrome, preserving the body and its selection.
+        for row in list(range(header_h)) + [height - 2, height - 1]:
+            self.add(row, 0, " " * width, 0, width)
+        self.draw_header(0, 0, header_h, width)
+        self.draw_footer(height - 2, 0, 2, width)
+        self.stdscr.refresh()
+
     def draw_header(self, y: int, x: int, height: int, width: int) -> None:
         if height <= 0:
             return
         snap = self.snapshot
-        if snap:
-            namespace = self.filter_display("namespace", snap.namespace)
-            left = "Context: %s | K8s: %s | User: %s | Namespace: %s | Metrics: %s" % (
-                snap.context,
-                snap.k8s_version,
-                snap.user,
-                namespace,
-                snap.metrics_status,
-            )
+        left = "Cluster:%s Context:%s Namespace:%s" % (
+            snap.cluster_name if snap else "-", snap.context if snap else "-",
+            self.filter_display("namespace", snap.namespace) if snap else "-")
+        self.add(y, x, left, self.colors.get("yellow", 0), width)
+        strip = self.source_strip(width)
+        for offset, line in enumerate(strip[:max(0, height - 1)], 1):
+            if offset == height - 1 and len(strip) > height - 1:
+                line = truncate(line, max(1, width - 20)) + " | F1:Sources more"
+            self.add(y + offset, x, line, 0, width)
+
+    def source_lines(self) -> List[str]:
+        if not self.snapshot:
+            return ["sources loading"]
+        lines = []
+        for name, info in self.snapshot.source_status.items():
+            at = info.get("observed_at")
+            state = info.get("state", "unavailable")
+            age = max(0, time.time() - at) if at else None
+            if state == "fresh" and age is not None and age > max(self.args.refresh_interval * 2, getattr(self.args, "secondary_refresh_interval", 30) * 2 if name not in ("pods", "nodes", "metrics") else 0):
+                state = "stale"
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(at)) if at else "N/A"
+            lines.append("%s: %s | %s | age %s" % (name, state, stamp, "%.0fs" % age if age is not None else "N/A"))
+            lines.extend("  " + error for error in info.get("errors", []))
+        return lines or ["demo sources: synthetic"]
+
+    def source_strip(self, width: int) -> List[str]:
+        if not self.snapshot:
+            return ["sources: loading"]
+        tokens = []
+        for name, info in self.snapshot.source_status.items():
+            if info.get("state") == "not-requested":
+                continue
+            at = info.get("observed_at")
+            state = info.get("state", "unavailable")
+            if state == "fresh" and at and time.time() - at > max(self.args.refresh_interval * 2, getattr(self.args, "secondary_refresh_interval", 30) * 2 if name not in ("pods", "nodes", "metrics") else 0):
+                state = "stale"
+            tokens.append("%s:%s@%s" % (name, state, time.strftime("%H:%M:%S", time.gmtime(at)) if at else "N/A"))
+        return textwrap.wrap(" | ".join(tokens) or "demo: synthetic", max(1, width))
+
+    @snapshot_cached(timed=True)
+    def incident_lines(self, page: str) -> List[str]:
+        if not self.snapshot:
+            return ["Loading snapshot..."]
+        if page == "timeline":
+            lines = ["Incident timeline: Events timestamps and observed snapshot changes; polling can miss transitions.",
+                     "Bounded to 1000 entries; UID when available, otherwise name-only identity."]
+            lines.extend("%s %s/%s/%s uid=%s %s %s [%s]" % (
+                entry.get("at") or "unknown time", entry.get("kind", ""), entry.get("namespace", ""), entry.get("name", ""),
+                entry.get("uid", ""), entry.get("change", ""), entry.get("message") or json.dumps(entry.get("fields", {}), ensure_ascii=False),
+                entry.get("source", "")) for entry in self.snapshot.timeline)
+            return lines
+        cached = self.snapshot.diagnostic_views.get(page)
+        return cached if cached is not None else {"network": network_lines, "degradation": degradation_lines, "security": security_context_lines}[page](self.snapshot)
+
+    def draw_compact(self, y: int, height: int, width: int) -> None:
+        """Use one focused table or text viewport on small terminals."""
+        if height < 2:
+            return
+        if self.page in ("network", "degradation", "timeline", "security"):
+            self.draw_text_page(y, 0, height, width, self.page, self.incident_lines(self.page), self.page)
+        elif self.page == "logs":
+            (self.draw_logs_plain if self.log_plain else self.draw_logs)(y, 0, height, width)
+        elif self.page == "viewer":
+            (self.draw_viewer_plain if self.viewer_plain else self.draw_viewer)(y, 0, height, width)
+        elif self.page == "namespaces":
+            self.draw_namespace_picker(y, 0, height, width)
+        elif self.page == "overview" and self.snapshot:
+            key = self.current_table_key()
+            if key == "nodes":
+                rows, columns, cell, order = self.current_nodes(), ["NAME", "STATUS", "CPU", "MEM"], self.node_cell, self.node_sort
+            elif key == "overview_namespaces":
+                rows, columns, cell, order = self.current_namespace_rows(), ["NAMESPACE", "PODS", "CPU", "MEMORY"], self.namespace_cell, self.namespace_sort
+            else:
+                rows, columns, cell, order = self.current_pods(), ["POD", "STATUS", "CPU", "MEMORY"], self.pod_cell, self.pod_sort
+            self.draw_table(y, 0, height, width, key + " | Tab focus", columns, rows, cell, key, order, True)
+        elif self.page == "cronjobs":
+            self.draw_cronjobs(y, 0, height, width)
+        elif self.page == "cronjob":
+            row = self.find_cronjob(self.current_cronjob)
+            if row:
+                self.draw_table(y, 0, height, width, row.name, ["POD", "STATUS", "CPU", "MEMORY"],
+                                self.cronjob_related_pods(row), self.pod_cell, "cronjob_pods", self.pod_sort, True)
+        elif self.page == "pod":
+            pod = self.find_pod(self.current_pod)
+            if pod:
+                self.draw_table(y, 0, height, width, pod.name, ["NAME", "STATE", "CPU", "MEM", "CPU REQ", "CPU LIM", "MEM REQ", "MEM LIM", "METRIC AGE"],
+                                pod.containers, self.pod_detail_container_cell, "containers", ("NAME", True), True)
+        elif self.page in ("node", "namespace"):
+            rows = self.current_namespace_pods(self.current_namespace or "") if self.page == "namespace" else [p for p in self.current_pods(True) if p.node == self.current_node]
+            key = "namespace_pods" if self.page == "namespace" else "node_pods"
+            self.draw_table(y, 0, height, width, self.current_namespace or self.current_node or "pods", ["POD", "STATUS", "CPU", "MEMORY"], rows, self.pod_cell, key, self.pod_sort, True)
         else:
-            left = "Context: - | K8s: - | User: - | Namespace: - | Metrics: loading"
-        refresh_state = self.refresh_state_text()
-        if refresh_state:
-            left += " | Refresh: %s" % refresh_state
-        right = "ktop-py.py: v%s" % __VERSION__
-        self.add(y, x + 1, left, self.colors.get("yellow", 0), max(1, width - len(right) - 4))
-        self.add(y, max(x + 1, x + width - len(right) - 1), right, curses.A_BOLD)
+            lines = (self.source_lines() if self.page == "sources" else self.health_lines() if self.page == "health" else
+                     self.resource_risk_lines() if self.page == "resources" else self.owner_lines() if self.page == "owner" else
+                     self.diagnostics_cache if self.page == "diagnostics" else help_lines() if self.page == "help" else
+                     ["Loading…" if not self.snapshot else "F1 commands | Esc back"])
+            self.draw_text_page(y, 0, height, width, self.page, lines, self.page)
 
     def refresh_state_text(self) -> str:
         if self.refreshing:
@@ -5295,16 +6640,11 @@ class KtopApp:
         evicted = sum(1 for pod in snap.pods if pod.status == "Evicted")
         restarts = sum(pod.restarts for pod in snap.pods)
         pressure = sum(1 for node in snap.nodes if node.pressures)
-        cpu_total = sum(node.alloc_cpu_m for node in snap.nodes)
-        mem_total = sum(node.alloc_mem_b for node in snap.nodes)
-        if snap.metrics_available:
-            cpu_value = sum(node.usage_cpu_m for node in snap.nodes)
-            mem_value = sum(node.usage_mem_b for node in snap.nodes)
-            label = "used"
-        else:
-            cpu_value = sum(node.requested_cpu_m for node in snap.nodes)
-            mem_value = sum(node.requested_mem_b for node in snap.nodes)
-            label = "requested"
+        cpu_total = finite_sum(node.alloc_cpu_m for node in snap.nodes)
+        mem_total = finite_sum(node.alloc_mem_b for node in snap.nodes)
+        cpu_value = finite_sum(node.usage_cpu_m for node in snap.nodes)
+        mem_value = finite_sum(node.usage_mem_b for node in snap.nodes)
+        label = "used"
         stat = (
             "Uptime: %s | Nodes: %d/%d | NS: %d | Deploys: %d/%d | Pods: %d/%d | Vols: %d | PVs: %d (%s) | PVCs: %d (%s)"
             % (
@@ -5323,16 +6663,21 @@ class KtopApp:
                 format_bytes(snap.pvc_capacity_b),
             )
         )
+        for key, label in (("deployments", "Deploys"), ("pv", "PVs"), ("pvc", "PVCs")):
+            if snap.source_status.get(key, {}).get("state") in ("loading", "unavailable", "forbidden", "not-requested"):
+                stat = re.sub(r"%s: [^|]+" % label, label + ": N/A ", stat)
+        if not snap.cluster_scope_available:
+            stat = "Namespace: %s | Nodes: N/A | PVs: N/A | Cluster aggregates: N/A | Pods: %d" % (snap.namespace, len(snap.pods))
         if height < METRIC_PANEL_HEIGHT + 4:
             self.draw_summary_compact(y, x, height, width, snap, stat, cpu_value, cpu_total, mem_value, mem_total, label)
             return
 
         self.add(y + 1, x + 2, stat, self.colors.get("yellow", 0), width - 4)
 
-        net_rx = sum(node.net_rx_bps for node in snap.nodes)
-        net_tx = sum(node.net_tx_bps for node in snap.nodes)
-        fs_read = sum(node.fs_read_bps for node in snap.nodes)
-        fs_write = sum(node.fs_write_bps for node in snap.nodes)
+        net_rx = finite_sum(node.net_rx_bps for node in snap.nodes)
+        net_tx = finite_sum(node.net_tx_bps for node in snap.nodes)
+        fs_read = finite_sum(node.fs_read_bps for node in snap.nodes)
+        fs_write = finite_sum(node.fs_write_bps for node in snap.nodes)
         net_scale = self.rate_pair_chart_scale(history_key_cluster("net_split"), snap.cluster_net_rx_history, net_rx, snap.cluster_net_tx_history, net_tx)
         io_scale = self.rate_pair_chart_scale(history_key_cluster("io_split"), snap.cluster_fs_read_history, fs_read, snap.cluster_fs_write_history, fs_write)
         panel_y = y + 2
@@ -5341,13 +6686,13 @@ class KtopApp:
         panel_gap = 1
         panels = [
             (
-                "CPU %s/%s (%4.1f%% %s)" % (format_mcpu(cpu_value), format_mcpu(cpu_total), ratio(cpu_value, cpu_total) * 100, label),
+                'CPU %s/%s (%s %s)' % (format_mcpu(cpu_value), format_mcpu(cpu_total), format_percent_value(ratio(cpu_value, cpu_total) * 100), label),
                 snap.cluster_cpu_history,
                 cpu_value,
                 cpu_total,
             ),
             (
-                "MEM %s/%s (%4.1f%% %s)" % (format_bytes(mem_value), format_bytes(mem_total), ratio(mem_value, mem_total) * 100, label),
+                'MEM %s/%s (%s %s)' % (format_bytes(mem_value), format_bytes(mem_total), format_percent_value(ratio(mem_value, mem_total) * 100), label),
                 snap.cluster_mem_history,
                 mem_value,
                 mem_total,
@@ -5415,10 +6760,10 @@ class KtopApp:
     ) -> None:
         self.add(y + 1, x + 2, stat, self.colors.get("yellow", 0), width - 4)
         graph_w = max(6, min(32, max(6, (width - 44) // 2)))
-        net_rx = sum(node.net_rx_bps for node in snap.nodes)
-        net_tx = sum(node.net_tx_bps for node in snap.nodes)
-        fs_read = sum(node.fs_read_bps for node in snap.nodes)
-        fs_write = sum(node.fs_write_bps for node in snap.nodes)
+        net_rx = finite_sum(node.net_rx_bps for node in snap.nodes)
+        net_tx = finite_sum(node.net_tx_bps for node in snap.nodes)
+        fs_read = finite_sum(node.fs_read_bps for node in snap.nodes)
+        fs_write = finite_sum(node.fs_write_bps for node in snap.nodes)
         net_current = net_rx + net_tx
         io_current = fs_read + fs_write
         net_scale = self.rate_chart_scale(history_key_cluster("net"), snap.cluster_net_history, net_current)
@@ -5426,24 +6771,24 @@ class KtopApp:
         rows = [
             (
                 "CPU",
-                "%s %s/%s (%4.1f%% %s)"
+                '%s %s/%s (%s %s)'
                 % (
                     self.trend_or_bar(snap.cluster_cpu_history, ratio(cpu_value, cpu_total), width=graph_w, total=cpu_total),
                     format_mcpu(cpu_value),
                     format_mcpu(cpu_total),
-                    ratio(cpu_value, cpu_total) * 100,
+                    format_percent_value(ratio(cpu_value, cpu_total) * 100),
                     label,
                 ),
                 self.resource_attr(ratio(cpu_value, cpu_total)),
             ),
             (
                 "MEM",
-                "%s %s/%s (%4.1f%% %s)"
+                '%s %s/%s (%s %s)'
                 % (
                     self.trend_or_bar(snap.cluster_mem_history, ratio(mem_value, mem_total), width=graph_w, total=mem_total),
                     format_bytes(mem_value),
                     format_bytes(mem_total),
-                    ratio(mem_value, mem_total) * 100,
+                    format_percent_value(ratio(mem_value, mem_total) * 100),
                     label,
                 ),
                 self.resource_attr(ratio(mem_value, mem_total)),
@@ -5575,11 +6920,24 @@ class KtopApp:
         Returns:
             Values padded or downsampled to exactly width items.
         """
-        clean = [float(value or 0.0) for value in history if math.isfinite(float(value or 0.0))]
+        if isinstance(history, TimedHistory) and history.timestamps:
+            config = getattr(self, "args", None)
+            period = max(0.001, getattr(config, "refresh_interval", DEFAULT_REFRESH_SECONDS),
+                         getattr(config, "prometheus_scrape_interval", DEFAULT_PROMETHEUS_SCRAPE_SECONDS))
+            latest = history.timestamps[-1]
+            # Cover the observed duration with at most width buckets.
+            period = max(period, (latest - history.timestamps[0]) / max(1, width - 1))
+            buckets: List[List[float]] = [[] for _ in range(width)]
+            for at, value in zip(history.timestamps, history):
+                index = width - 1 - int(round((latest - at) / period))
+                if 0 <= index < width:
+                    buckets[index].append(value)
+            return [finite_sum(bucket) / len(bucket) if bucket else MISSING for bucket in buckets]
+        clean = [float(value) for value in history]
         if not clean:
             clean = [float(current or 0.0)]
         if len(clean) == 1:
-            return [0.0] * (width - 1) + clean
+            return [MISSING] * (width - 1) + clean
         if len(clean) > width:
             # Downsample by averaging buckets instead of dropping spikes blindly.
             # Уменьшаем историю средними bucket, а не простым отбрасыванием.
@@ -5589,10 +6947,10 @@ class KtopApp:
                 start = int(idx * step)
                 end = int((idx + 1) * step)
                 chunk = clean[start : max(start + 1, end)]
-                reduced.append(sum(chunk) / float(len(chunk)))
+                reduced.append(finite_sum(chunk) / float(len(chunk)))
             clean = reduced
         if len(clean) < width:
-            clean = [0.0] * (width - len(clean)) + clean
+            clean = [MISSING] * (width - len(clean)) + clean
         return clean
 
     def chart_sample_count(self, history: Sequence[float], current: float, width: int) -> int:
@@ -5742,6 +7100,33 @@ class KtopApp:
             focused=self.page == "cronjobs",
         )
 
+    def row_identity(self, row: Any) -> Any:
+        raw = getattr(row, "raw", {})
+        return (type(row).__name__, safe_get(raw, ["metadata", "uid"], "") or
+                (getattr(row, "namespace", ""), getattr(row, "name", str(row))))
+
+    def reconcile_selection(self, key: str, rows: Sequence[Any]) -> int:
+        if not hasattr(self, "selection_ids"):
+            self.selection_ids, self.selection_rows = {}, {}
+        anchor = self.selection_ids.get(key)
+        selected = min(self.selected.get(key, 0), len(rows) - 1)
+        if anchor is not None:
+            selected = next((i for i, row in enumerate(rows) if self.row_identity(row) == anchor), -1)
+            if selected < 0 and self.selected.get(key, 0) >= 0:
+                self.flash("Selected object disappeared or is filtered out; use arrows to select again", ttl=8.0)
+        elif selected >= 0:
+            self.selection_ids[key] = self.row_identity(rows[selected])
+        self.selection_rows[key] = rows
+        self.selected[key] = selected
+        return selected
+
+    def remember_selection(self) -> None:
+        key = self.current_table_key()
+        rows = self.selection_rows.get(key, [])
+        index = self.selected.get(key, -1)
+        if 0 <= index < len(rows):
+            self.selection_ids[key] = self.row_identity(rows[index])
+
     def draw_table(
         self,
         y: int,
@@ -5761,8 +7146,7 @@ class KtopApp:
         header_y = y + 1
         data_y = y + 2
         data_h = max(0, height - 3)
-        selected = min(self.selected.get(state_key, 0), max(0, len(rows) - 1))
-        self.selected[state_key] = selected
+        selected = self.reconcile_selection(state_key, rows)
         scroll = self.adjust_scroll(state_key, selected, data_h, len(rows))
         col_widths = self.column_widths(columns, inner_w)
         total_w = sum(col_widths.get(col, 0) for col in columns) + max(0, len(columns) - 1)
@@ -5775,11 +7159,11 @@ class KtopApp:
 
         def draw_virtual(row_y: int, start: int, text: str, attr: int) -> None:
             visible_start = max(0, hscroll - start)
-            visible_end = min(len(text), hscroll + inner_w - start)
+            visible_end = min(cell_width(text), hscroll + inner_w - start)
             if visible_end <= visible_start:
                 return
             draw_x = x + 1 + max(0, start - hscroll)
-            self.add(row_y, draw_x, text[visible_start:visible_end], attr, visible_end - visible_start)
+            self.add(row_y, draw_x, cell_slice(text, visible_start, visible_end - visible_start), attr, visible_end - visible_start)
 
         header_attr = self.colors.get("black_on_cyan", curses.A_REVERSE)
         self.add(header_y, x + 1, " " * inner_w, header_attr, inner_w)
@@ -5788,12 +7172,12 @@ class KtopApp:
             col_w = col_widths.get(col, 0)
             if col_w <= 0:
                 continue
-            label = col + (" ↑" if col == sort_col and asc else " ↓" if col == sort_col else "")
-            segment = truncate(label, col_w).ljust(col_w)
+            label = ({"CPU": "CPU USE", "MEM": "MEM USE", "MEMORY": "MEM USE"}.get(col, col)) + (" ↑" if col == sort_col and asc else " ↓" if col == sort_col else "")
+            segment = cell_pad(truncate(label, col_w), col_w)
             if idx < len(columns) - 1:
                 segment += " "
             draw_virtual(header_y, virtual_x, segment, header_attr)
-            virtual_x += len(segment)
+            virtual_x += cell_width(segment)
         for idx, row in enumerate(rows[scroll : scroll + data_h], start=scroll):
             row_y = data_y + idx - scroll
             base_attr = 0
@@ -5809,11 +7193,11 @@ class KtopApp:
                 attr = base_attr if attr is None else attr
                 if focused and idx == selected:
                     attr = curses.A_REVERSE
-                segment = truncate(text, col_w).ljust(col_w)
+                segment = cell_pad(truncate(text, col_w), col_w)
                 if col_idx < len(columns) - 1:
                     segment += " "
                 draw_virtual(row_y, virtual_x, segment, attr)
-                virtual_x += len(segment)
+                virtual_x += cell_width(segment)
         indicators = []
         if len(rows) > data_h and data_h > 0:
             indicators.append("%d-%d/%d" % (scroll + 1, min(len(rows), scroll + data_h), len(rows)))
@@ -5853,6 +7237,7 @@ class KtopApp:
             "IMAGE": 34,
             "CPU USE": 13,
             "MEM USE": 13,
+            "METRIC AGE": 12,
             "CPU REQ": 9,
             "MEM REQ": 9,
             "CPU LIM": 9,
@@ -5945,7 +7330,7 @@ class KtopApp:
         if col == "NAME":
             return ("*" + node.name if node.controller else node.name, self.colors.get("yellow", 0))
         if col == "STATUS":
-            return node.status, self.status_attr(node.status)
+            return node.status + (" [metrics stale]" if any(q["state"] == "stale" for q in node.metric_quality.values()) else ""), self.status_attr(node.status)
         if col == "RST":
             return str(node.restarts), self.colors.get("yellow", 0) if node.restarts else self.colors.get("green", 0)
         if col == "PODS":
@@ -5963,11 +7348,11 @@ class KtopApp:
         if col == "CPU":
             value = self.display_usage(node.usage_cpu_m, node.requested_cpu_m, node.cpu_history)
             pct = ratio(value, node.alloc_cpu_m) * 100
-            return "%s %5s %4.1f%% %s" % (self.trend_or_bar(node.cpu_history, pct / 100.0, total=node.alloc_cpu_m), format_mcpu(value), pct, self.history_arrow(node.cpu_history)), self.resource_attr(pct / 100.0)
+            return '%s %5s %s %s' % (self.trend_or_bar(node.cpu_history, pct / 100.0, total=node.alloc_cpu_m), format_mcpu(value), format_percent_value(pct), self.history_arrow(node.cpu_history)), self.resource_attr(pct / 100.0)
         if col == "MEM":
             value = self.display_usage(node.usage_mem_b, node.requested_mem_b, node.mem_history)
             pct = ratio(value, node.alloc_mem_b) * 100
-            return "%s %6s %4.1f%% %s" % (self.trend_or_bar(node.mem_history, pct / 100.0, total=node.alloc_mem_b), format_bytes(value), pct, self.history_arrow(node.mem_history)), self.resource_attr(pct / 100.0)
+            return '%s %6s %s %s' % (self.trend_or_bar(node.mem_history, pct / 100.0, total=node.alloc_mem_b), format_bytes(value), format_percent_value(pct), self.history_arrow(node.mem_history)), self.resource_attr(pct / 100.0)
         if col == "DISK R":
             return self.rate_mini_cell(history_key_node(node.name, "io_read"), node.fs_read_history, node.fs_read_bps)
         if col == "DISK W":
@@ -6000,11 +7385,11 @@ class KtopApp:
         if col == "CPU":
             value = self.display_usage(namespace.usage_cpu_m, namespace.requested_cpu_m, namespace.cpu_history)
             pct = ratio(value, namespace.cpu_total_m) * 100.0
-            return "%s %5s %4.1f%% %s" % (self.trend_or_bar(namespace.cpu_history, pct / 100.0, total=namespace.cpu_total_m), format_mcpu(value), pct, self.history_arrow(namespace.cpu_history)), self.resource_attr(pct / 100.0)
+            return '%s %5s %s %s' % (self.trend_or_bar(namespace.cpu_history, pct / 100.0, total=namespace.cpu_total_m), format_mcpu(value), format_percent_value(pct), self.history_arrow(namespace.cpu_history)), self.resource_attr(pct / 100.0)
         if col == "MEMORY":
             value = self.display_usage(namespace.usage_mem_b, namespace.requested_mem_b, namespace.mem_history)
             pct = ratio(value, namespace.mem_total_b) * 100.0
-            return "%s %6s %4.1f%% %s" % (self.trend_or_bar(namespace.mem_history, pct / 100.0, total=namespace.mem_total_b), format_bytes(value), pct, self.history_arrow(namespace.mem_history)), self.resource_attr(pct / 100.0)
+            return '%s %6s %s %s' % (self.trend_or_bar(namespace.mem_history, pct / 100.0, total=namespace.mem_total_b), format_bytes(value), format_percent_value(pct), self.history_arrow(namespace.mem_history)), self.resource_attr(pct / 100.0)
         if col == "DISK R":
             return self.rate_mini_cell(history_key_namespace(namespace.name, "io_read"), namespace.fs_read_history, namespace.fs_read_bps)
         if col == "DISK W":
@@ -6071,7 +7456,19 @@ class KtopApp:
             return row.hint, attr
         return "-", None
 
+    def measurement_age(self, row: Any) -> str:
+        times = [info.get("observed_at") for info in getattr(row, "metric_quality", {}).values()
+                 if info.get("observed_at") is not None]
+        return "%.0fs" % max(0, time.time() - min(times)) if times else "N/A"
+
     def pod_cell(self, pod: PodRow, col: str) -> Tuple[str, Optional[int]]:
+        if col == "METRIC AGE":
+            return self.measurement_age(pod), None
+        if col in ("CPU REQ", "MEM REQ"):
+            return (format_mcpu(pod.requested_cpu_m) if col == "CPU REQ" else format_bytes(pod.requested_mem_b)), None
+        if col in ("CPU LIM", "MEM LIM"):
+            cpu, mem = pod_resource_totals(pod.raw, "limits")
+            return (format_mcpu(cpu) if col == "CPU LIM" else format_bytes(mem)), None
         if col == "NAMESPACE":
             return pod.namespace, self.colors.get("yellow", 0)
         if col == "POD":
@@ -6079,7 +7476,7 @@ class KtopApp:
         if col == "READY":
             return "%d/%d" % (pod.ready, pod.total), self.colors.get("yellow", 0)
         if col == "STATUS":
-            return pod.status, self.status_attr(pod.status)
+            return pod.status + (" [metrics stale]" if any(q["state"] == "stale" for q in pod.metric_quality.values()) else ""), self.status_attr(pod.status)
         if col == "RST":
             return str(pod.restarts), self.colors.get("yellow", 0) if pod.restarts else None
         if col == "AGE":
@@ -6093,11 +7490,11 @@ class KtopApp:
         if col == "CPU":
             value = self.display_usage(pod.usage_cpu_m, pod.requested_cpu_m, pod.cpu_history)
             pct = ratio(value, pod.node_alloc_cpu_m) * 100
-            return "%s %5s %4.1f%% %s" % (self.trend_or_bar(pod.cpu_history, pct / 100.0, total=pod.node_alloc_cpu_m), format_mcpu(value), pct, self.history_arrow(pod.cpu_history)), self.resource_attr(pct / 100.0)
+            return '%s %5s %s %s' % (self.trend_or_bar(pod.cpu_history, pct / 100.0, total=pod.node_alloc_cpu_m), format_mcpu(value), format_percent_value(pct), self.history_arrow(pod.cpu_history)), self.resource_attr(pct / 100.0)
         if col == "MEMORY":
             value = self.display_usage(pod.usage_mem_b, pod.requested_mem_b, pod.mem_history)
             pct = ratio(value, pod.node_alloc_mem_b) * 100
-            return "%s %6s %4.1f%% %s" % (self.trend_or_bar(pod.mem_history, pct / 100.0, total=pod.node_alloc_mem_b), format_bytes(value), pct, self.history_arrow(pod.mem_history)), self.resource_attr(pct / 100.0)
+            return '%s %6s %s %s' % (self.trend_or_bar(pod.mem_history, pct / 100.0, total=pod.node_alloc_mem_b), format_bytes(value), format_percent_value(pct), self.history_arrow(pod.mem_history)), self.resource_attr(pct / 100.0)
         return "-", None
 
     def draw_namespace_detail(self, y: int, x: int, height: int, width: int) -> None:
@@ -6186,16 +7583,16 @@ class KtopApp:
         io_scale = self.rate_pair_chart_scale(history_key_namespace(namespace.name, "io_split"), namespace.fs_read_history, namespace.fs_read_bps, namespace.fs_write_history, namespace.fs_write_bps)
         usage_metrics = [
             (
-                "CPU %s/%s (%4.1f%% used) %s"
-                % (format_cpu_millis(cpu_value), format_cpu_millis(namespace.cpu_total_m), ratio(cpu_value, namespace.cpu_total_m) * 100, self.history_arrow(namespace.cpu_history)),
+                'CPU %s/%s (%s used) %s'
+                % (format_cpu_millis(cpu_value), format_cpu_millis(namespace.cpu_total_m), format_percent_value(ratio(cpu_value, namespace.cpu_total_m) * 100), self.history_arrow(namespace.cpu_history)),
                 namespace.cpu_history,
                 cpu_value,
                 namespace.cpu_total_m,
                 self.resource_attr(ratio(cpu_value, namespace.cpu_total_m)),
             ),
             (
-                "MEM %s/%s (%4.1f%% used) %s"
-                % (format_mib(mem_value), format_mib(namespace.mem_total_b), ratio(mem_value, namespace.mem_total_b) * 100, self.history_arrow(namespace.mem_history)),
+                'MEM %s/%s (%s used) %s'
+                % (format_mib(mem_value), format_mib(namespace.mem_total_b), format_percent_value(ratio(mem_value, namespace.mem_total_b) * 100), self.history_arrow(namespace.mem_history)),
                 namespace.mem_history,
                 mem_value,
                 namespace.mem_total_b,
@@ -6321,14 +7718,14 @@ class KtopApp:
         io_scale = self.rate_pair_chart_scale(history_key_node(node.name, "io_split"), node.fs_read_history, node.fs_read_bps, node.fs_write_history, node.fs_write_bps)
         usage_metrics = [
             (
-                "CPU %s/%s (%4.1f%% used)" % (format_cpu_millis(cpu_value), format_cpu_millis(node.alloc_cpu_m), ratio(cpu_value, node.alloc_cpu_m) * 100),
+                'CPU %s/%s (%s used)' % (format_cpu_millis(cpu_value), format_cpu_millis(node.alloc_cpu_m), format_percent_value(ratio(cpu_value, node.alloc_cpu_m) * 100)),
                 node.cpu_history,
                 cpu_value,
                 node.alloc_cpu_m,
                 self.resource_attr(ratio(cpu_value, node.alloc_cpu_m)),
             ),
             (
-                "MEM %s/%s (%4.1f%% used) %s" % (format_mib(mem_value), format_mib(node.alloc_mem_b), ratio(mem_value, node.alloc_mem_b) * 100, self.history_arrow(node.mem_history)),
+                'MEM %s/%s (%s used) %s' % (format_mib(mem_value), format_mib(node.alloc_mem_b), format_percent_value(ratio(mem_value, node.alloc_mem_b) * 100), self.history_arrow(node.mem_history)),
                 node.mem_history,
                 mem_value,
                 node.alloc_mem_b,
@@ -6413,7 +7810,7 @@ class KtopApp:
     def node_system_rows(self, node: NodeRow) -> List[Tuple[str, str, int]]:
         alloc_pods = safe_get(node.raw, ["status", "allocatable", "pods"], "-") or "-"
         cidr = safe_get(node.raw, ["spec", "podCIDR"]) or ",".join(safe_get(node.raw, ["spec", "podCIDRs"], []) or []) or "-"
-        return [
+        return [("Metrics", quality_summary(node), 0),
             ("MachineID", safe_get(node.raw, ["status", "nodeInfo", "machineID"], "-") or "-", 0),
             ("OS", node.os_image, 0),
             ("Arch", node.arch, 0),
@@ -6507,7 +7904,7 @@ class KtopApp:
             containers_h,
             width - 2,
             "Containers (%d) - Enter/l: logs" % len(pod.containers),
-            ["NAME", "IMAGE", "STATE", "READY", "RESTARTS", "CPU", "MEM"],
+            ["NAME", "IMAGE", "STATE", "READY", "RESTARTS", "CPU", "MEM", "CPU REQ", "CPU LIM", "MEM REQ", "MEM LIM", "METRIC AGE"],
             pod.containers,
             self.pod_detail_container_cell,
             "containers",
@@ -6532,7 +7929,7 @@ class KtopApp:
             max(5, height - 4),
             width - 2,
             "Containers (%d) - Enter/l: logs" % len(pod.containers),
-            ["NAME", "IMAGE", "STATE", "READY", "RESTARTS", "CPU", "MEM"],
+            ["NAME", "IMAGE", "STATE", "READY", "RESTARTS", "CPU", "MEM", "CPU REQ", "CPU LIM", "MEM REQ", "MEM LIM", "METRIC AGE"],
             pod.containers,
             self.pod_detail_container_cell,
             "containers",
@@ -6561,15 +7958,15 @@ class KtopApp:
         io_scale = self.rate_pair_chart_scale(history_key_pod(pod.namespace, pod.name, "io_split"), pod.fs_read_history, pod.fs_read_bps, pod.fs_write_history, pod.fs_write_bps)
         usage_metrics = [
             (
-                "CPU %s/%s (%4.1f%% used) %s"
-                % (format_cpu_millis(cpu_value), format_cpu_millis(pod.node_alloc_cpu_m), ratio(cpu_value, pod.node_alloc_cpu_m) * 100, self.history_arrow(pod.cpu_history)),
+                'CPU %s/%s (%s used) %s'
+                % (format_cpu_millis(cpu_value), format_cpu_millis(pod.node_alloc_cpu_m), format_percent_value(ratio(cpu_value, pod.node_alloc_cpu_m) * 100), self.history_arrow(pod.cpu_history)),
                 pod.cpu_history,
                 cpu_value,
                 pod.node_alloc_cpu_m,
                 self.resource_attr(ratio(cpu_value, pod.node_alloc_cpu_m)),
             ),
             (
-                "MEM %s/%s (%4.1f%% used)" % (format_mib(mem_value), format_mib(pod.node_alloc_mem_b), ratio(mem_value, pod.node_alloc_mem_b) * 100),
+                'MEM %s/%s (%s used)' % (format_mib(mem_value), format_mib(pod.node_alloc_mem_b), format_percent_value(ratio(mem_value, pod.node_alloc_mem_b) * 100)),
                 pod.mem_history,
                 mem_value,
                 pod.node_alloc_mem_b,
@@ -6637,7 +8034,7 @@ class KtopApp:
 
     def pod_info_rows(self, pod: PodRow) -> List[Tuple[str, str, int]]:
         term_grace = safe_get(pod.raw, ["spec", "terminationGracePeriodSeconds"])
-        return [
+        return [("Metrics", quality_summary(pod), 0),
             ("Owner", owner_chain_text(pod.owner_chain), self.colors.get("cyan", 0) if pod.owner_chain else 0),
             ("ServiceAcct", safe_get(pod.raw, ["spec", "serviceAccountName"], "-") or "-", 0),
             ("Priority", str(safe_get(pod.raw, ["spec", "priority"], "-") or "-"), 0),
@@ -6658,8 +8055,7 @@ class KtopApp:
             rows.append((ctype, status, ok if status == "True" else bad))
         rows.append(("", "Resources", self.colors.get("cyan", 0)))
         rows.append(("Requests", "%s / %s" % (format_resource_cpu(pod.requested_cpu_m), format_resource_mem(pod.requested_mem_b)), 0))
-        cpu_limit = sum(container.cpu_limit_m for container in pod.containers)
-        mem_limit = sum(container.mem_limit_b for container in pod.containers)
+        cpu_limit, mem_limit = pod_resource_totals(pod.raw, "limits")
         rows.append(("Limits", "%s / %s" % (format_resource_cpu(cpu_limit), format_resource_mem(mem_limit)), 0))
         return rows
 
@@ -6674,8 +8070,12 @@ class KtopApp:
         return ",".join(policies) if policies else "-"
 
     def pod_detail_container_cell(self, container: ContainerInfo, col: str) -> Tuple[str, Optional[int]]:
+        if col == "METRIC AGE":
+            return self.measurement_age(container), None
+        if col in ("CPU REQ", "CPU LIM", "MEM REQ", "MEM LIM"):
+            return self.container_cell(container, col)
         if col == "NAME":
-            return container.name, 0
+            return container.name + (" [%s]" % container.kind if container.kind != "app" else ""), 0
         if col == "IMAGE":
             return container.image, 0
         if col == "STATE":
@@ -6692,9 +8092,9 @@ class KtopApp:
 
     def container_cell(self, container: ContainerInfo, col: str) -> Tuple[str, Optional[int]]:
         if col == "CONTAINER":
-            return container.name, None
+            return container.name + (" [%s]" % container.kind if container.kind != "app" else ""), None
         if col == "STATUS":
-            return container.status, self.status_attr(container.status)
+            return container.status + (" [metrics stale]" if any(q["state"] == "stale" for q in container.metric_quality.values()) else ""), self.status_attr(container.status)
         if col == "RST":
             return str(container.restarts), self.colors.get("yellow", 0) if container.restarts else None
         if col == "IMAGE":
@@ -6834,6 +8234,7 @@ class KtopApp:
             return self.colors.get("green", 0)
         return self.colors.get("yellow", 0)
 
+    @snapshot_cached(timed=True)
     def health_data(self) -> Optional[HealthData]:
         """Build structured Problems / Health data. / Формирует структурированные данные Problems / Health.
 
@@ -6925,7 +8326,13 @@ class KtopApp:
                 where = "%s %s" % (event.namespace, where)
             event_findings.append(("%-5s %-14s %-44s %-16s %s" % ("EVT", human_age(event.timestamp), truncate(where, 44), event.reason or "-", truncate(event.message, 90)), "warning"))
 
+        degradation = snap.diagnostic_views.get("degradation") or degradation_lines(snap)
+        severity = lambda line: "critical" if any(word in line for word in ("OOMKilled", "init waiting", "DiskPressure=True")) else "warning"
+        pod_findings.extend((line, severity(line)) for line in degradation if line.startswith("Pod/"))
+        node_findings.extend((line, severity(line)) for line in degradation if line.startswith("Node/"))
         collection_warnings = [("WARN  %-14s %-44s %s" % ("collection", "-", warning), "warning") for warning in snap.warnings]
+        collection_warnings.extend(("WARN  %-14s %-44s %s" % ("diagnostics", "-", line), "warning")
+                                   for line in degradation[1:4] if "=fresh" not in line)
         resource_findings = self.health_resource_findings(snap)
         scheduling_findings = self.health_scheduling_findings(snap)
         return HealthData(
@@ -7002,13 +8409,13 @@ class KtopApp:
                 used_value = self.quota_quantity_value(resource, used.get(resource))
                 pct = ratio(used_value, hard_value) * 100.0
                 severity = "critical" if pct >= 98.0 else "warning" if pct >= 80.0 else "ok"
-                line = "%-5s %-36s %-18s used=%-9s hard=%-9s %5.1f%%" % (
+                line = '%-5s %-36s %-18s used=%-9s hard=%-9s %s' % (
                     "QUOTA",
                     truncate("%s/%s" % (namespace, name), 36),
                     truncate(resource, 18),
                     self.quota_quantity_text(resource, used_value),
                     self.quota_quantity_text(resource, hard_value),
-                    pct,
+                    format_percent_value(pct),
                 )
                 rows.append((line, severity))
         return rows
@@ -7166,6 +8573,8 @@ class KtopApp:
 
     def health_scheduling_findings(self, snap: ClusterSnapshot) -> List[Tuple[str, str]]:
         """Build approximate scheduler-fit rows. / Формирует строки приблизительной планируемости."""
+        if not snap.cluster_scope_available:
+            return [("SCHED N/A: node data unavailable in namespace-only mode", "warning")]
         rows: List[Tuple[str, str]] = []
         nodes = snap.nodes
         node_by_name = {node.name: node for node in nodes}
@@ -7218,13 +8627,14 @@ class KtopApp:
             Rows with severity for node and namespace resource pressure.
         """
         rows: List[Tuple[str, str]] = []
+        if not snap.cluster_scope_available:
+            rows.append(("RES N/A: cluster capacity unavailable; namespace quotas are checked separately", "warning"))
         node_limits: Dict[str, List[float]] = {}
         namespace_totals: Dict[str, List[float]] = {}
         for pod in snap.pods:
             pod_cpu = self.display_usage(pod.usage_cpu_m, pod.requested_cpu_m, pod.cpu_history)
             pod_mem = self.display_usage(pod.usage_mem_b, pod.requested_mem_b, pod.mem_history)
-            pod_limit_cpu = sum(container.cpu_limit_m for container in pod.containers)
-            pod_limit_mem = sum(container.mem_limit_b for container in pod.containers)
+            pod_limit_cpu, pod_limit_mem = pod_resource_totals(pod.raw, "limits")
             if pod.node and pod.node != "-":
                 node_limits.setdefault(pod.node, [0.0, 0.0])
                 node_limits[pod.node][0] += pod_limit_cpu
@@ -7302,8 +8712,8 @@ class KtopApp:
             add_resource_row("NODE", node.name, "CPU", node.alloc_cpu_m, self.display_usage(node.usage_cpu_m, node.requested_cpu_m, node.cpu_history), node.requested_cpu_m, limit_cpu, format_mcpu, extra)
             add_resource_row("NODE", node.name, "MEM", node.alloc_mem_b, self.display_usage(node.usage_mem_b, node.requested_mem_b, node.mem_history), node.requested_mem_b, limit_mem, format_bytes, extra)
 
-        cluster_cpu = sum(node.alloc_cpu_m for node in snap.nodes)
-        cluster_mem = sum(node.alloc_mem_b for node in snap.nodes)
+        cluster_cpu = finite_sum(node.alloc_cpu_m for node in snap.nodes)
+        cluster_mem = finite_sum(node.alloc_mem_b for node in snap.nodes)
         for namespace, values in sorted(namespace_totals.items()):
             req_cpu, req_mem, limit_cpu, limit_mem, use_cpu, use_mem = values
             add_resource_row("NS", namespace, "CPU", cluster_cpu, use_cpu, req_cpu, limit_cpu, format_mcpu, "share of cluster")
@@ -7496,24 +8906,13 @@ class KtopApp:
         self.draw_health_rows_panel(bottom_y, inner_x, bottom_h, inner_w, "Resource Pressure / Collection", "health_resources", header, rows, empty)
 
     def resource_metric_value(self, usage: float, fallback: float, history: Sequence[float], metrics_available: bool) -> float:
-        """Choose live usage or request fallback for resource summaries. / Выбирает live usage или request fallback.
-
-        Args:
-            usage: Current live usage value.
-            fallback: Request value used when live metrics are missing.
-            history: Retained live metric history.
-            metrics_available: Whether the snapshot has live metrics.
-        Returns:
-            Numeric value suitable for top-consumer summaries.
-        """
-        if metrics_available and (usage > 0 or clean_metric_values(history)):
-            return max(0.0, float(usage or 0.0))
-        return max(0.0, float(fallback or 0.0))
+        return float(usage) if metrics_available else MISSING
 
     def resource_container_label(self, pod: PodRow, container: ContainerInfo) -> str:
         """Build a compact container identity. / Формирует компактное имя контейнера."""
         return "%-12s %-38s %-18s" % (pod.namespace, truncate(pod.name, 38), truncate(container.name, 18))
 
+    @snapshot_cached()
     def resource_risk_data(self) -> Optional[ResourceRiskData]:
         """Build structured Resource Risk data. / Формирует структурированные данные Resource Risk.
 
@@ -7524,7 +8923,7 @@ class KtopApp:
         if not snap:
             return None
 
-        containers = [(pod, container) for pod in snap.pods for container in pod.containers]
+        containers = [(pod, container) for pod in snap.pods for container in pod.containers if container.kind != "ephemeral"]
         missing_requests_rows: List[Tuple[PodRow, ContainerInfo, str, str]] = []
         missing_limits_rows: List[Tuple[PodRow, ContainerInfo, str, str]] = []
         ratio_findings: List[Tuple[float, str, str, PodRow, ContainerInfo, str, str]] = []
@@ -7610,7 +9009,7 @@ class KtopApp:
             % (
                 data.loaded_at,
                 data.metrics_status,
-                "live usage with request fallback" if data.metrics_available else "requests fallback",
+                "measured usage; N/A where missing" if data.metrics_available else "N/A (metrics unavailable)",
             ),
             "",
             "Summary",
@@ -7647,8 +9046,8 @@ class KtopApp:
         elif data.ratio_findings:
             for score, resource, base_name, pod, container, used, base_value in data.ratio_findings[:40]:
                 lines.append(
-                    "  %-4s %5.0f%% %s use=%s %s=%s"
-                    % (resource, score * 100.0, self.resource_container_label(pod, container), used, base_name, base_value)
+                    '  %-4s %s %s use=%s %s=%s'
+                    % (resource, format_percent_value(score * 100.0), self.resource_container_label(pod, container), used, base_name, base_value)
                 )
             if len(data.ratio_findings) > 40:
                 lines.append("  ... %d more high ratio finding(s)" % (len(data.ratio_findings) - 40))
@@ -7807,9 +9206,9 @@ class KtopApp:
         rows: List[Tuple[str, int]] = []
         for score, resource, base_name, pod, container, used, base_value in data.ratio_findings:
             ident = "%s/%s" % (pod.name, container.name)
-            line = "%-4s %5.0f%% %-10s %-52s %-9s %s/%s" % (
+            line = '%-4s %s %-10s %-52s %-9s %s/%s' % (
                 resource,
-                score * 100.0,
+                format_percent_value(score * 100.0),
                 base_name,
                 truncate(ident, 52),
                 self.bar(7, min(score, 1.0)),
@@ -7902,7 +9301,7 @@ class KtopApp:
             y + 1,
             inner_x + 1,
             "Loaded: %s | Metrics: %s | Top values: %s"
-            % (data.loaded_at, data.metrics_status, "live usage with request fallback" if data.metrics_available else "requests fallback"),
+            % (data.loaded_at, data.metrics_status, "measured usage; N/A where missing" if data.metrics_available else "N/A (metrics unavailable)"),
             self.colors.get("yellow", 0),
             inner_w - 2,
         )
@@ -7994,8 +9393,8 @@ class KtopApp:
                                 item.ready,
                                 item.total,
                                 item.restarts,
-                                format_mcpu(item.usage_cpu_m or item.requested_cpu_m),
-                                format_bytes(item.usage_mem_b or item.requested_mem_b),
+                                format_mcpu(item.usage_cpu_m),
+                                format_bytes(item.usage_mem_b),
                             )
                         )
                     if len(controlled) > 20:
@@ -8018,6 +9417,8 @@ class KtopApp:
         """
         if not self.snapshot:
             return ["(all)"]
+        if getattr(getattr(self, "args", None), "namespace_only", False):
+            return [self.snapshot.namespace]
         names = list(self.snapshot.namespaces)
         if not names:
             names = sorted(set(pod.namespace for pod in self.snapshot.pods if pod.namespace))
@@ -8074,28 +9475,47 @@ class KtopApp:
         return getattr(self, "filters", {}).get(key, "")
 
     def query_error(self, query: str) -> str:
-        """Validate a safe regex query for search fallback. / Проверяет безопасный regex query.
-
-        Args:
-            query: User-entered search expression.
-        Returns:
-            Empty string for a usable regex; otherwise a fallback reason.
-        """
-        if not query:
+        if not query.startswith("re:"):
             return ""
-        if len(query) > MAX_SEARCH_REGEX_LENGTH:
-            return "regex too long (%d > %d)" % (len(query), MAX_SEARCH_REGEX_LENGTH)
-        if _REGEX_NESTED_REPEAT_RE.search(query):
-            return "potentially expensive nested repeat"
-        if _REGEX_REPEATED_ALT_RE.search(query):
-            return "potentially expensive repeated alternation"
-        try:
-            re.compile(query, re.IGNORECASE)
-        except re.error as exc:
-            return str(exc)
-        return ""
+        pattern = query[3:]
+        if len(pattern) > MAX_SEARCH_REGEX_LENGTH:
+            return "regex too long (%d > %d)" % (len(pattern), MAX_SEARCH_REGEX_LENGTH)
+        failure = getattr(self, "regex_failure", (None, ""))
+        return failure[1] if failure[0] == query else ""
 
-    def text_view_lines(self, source: Sequence[str], width: int, wrap: bool, preserve_whitespace: bool) -> List[str]:
+    def regex_spans(self, lines: Sequence[str], query: str) -> Dict[str, List[Tuple[int, int]]]:
+        cache = getattr(self, "regex_cache", (None, {}))
+        if cache[0] == query and all(line in cache[1] for line in lines):
+            return cache[1]
+        if self.query_error(query):
+            return {}
+        # Compilation and matching are both isolated. Bounds cover the whole buffer,
+        # rather than multiplying a timeout by the number of lines.
+        if sum(len(line) for line in lines) > DEFAULT_LOG_LIMIT_BYTES:
+            self.regex_failure = (query, "regex input exceeds search budget")
+            return {}
+        payload = json.dumps([query[3:], list(dict.fromkeys(lines))], ensure_ascii=True).encode("ascii")
+        worker = ("import json,re,sys; q,lines=json.load(sys.stdin); p=re.compile(q,re.I); "
+                  "json.dump([[[m.start(),m.end()] for m in p.finditer(t) if m.end()>m.start()] "
+                  "for t in lines],sys.stdout)")
+        try:
+            code, output, error = bounded_command(
+                [sys.executable, "-I", "-c", worker], REGEX_TIMEOUT_SECONDS,
+                4 * DEFAULT_LOG_LIMIT_BYTES, payload,
+            )
+            if code:
+                raise DataError(error.decode("utf-8", errors="replace").splitlines()[-1] if error else "regex failed")
+            spans = json.loads(output.decode("utf-8"))
+            result = {line: [tuple(span) for span in matches]
+                      for line, matches in zip(dict.fromkeys(lines), spans)}
+            self.regex_cache = (query, result)
+            return result
+        except (DataError, ValueError) as exc:
+            self.regex_failure = (query, str(exc))
+            self.regex_cache = (None, {})
+            return {}
+
+    def text_view_lines(self, source: Sequence[str], width: int, wrap: bool, preserve_whitespace: bool) -> Sequence[str]:
         """Prepare unfiltered text for a viewport. / Готовит полный текст для viewport без фильтрации.
 
         Args:
@@ -8107,62 +9527,49 @@ class KtopApp:
             Renderable viewport lines.
         """
         width = max(1, width)
-        if not wrap:
-            return [truncate(line, width) for line in source]
-        wrapped: List[str] = []
-        wrap_width = max(20, width)
-        for line in source:
-            safe_line = sanitize_terminal_text(line)
-            wrapped.extend(
-                textwrap.wrap(
-                    safe_line,
-                    wrap_width,
-                    replace_whitespace=not preserve_whitespace,
-                    drop_whitespace=not preserve_whitespace,
-                )
-                or [""]
-            )
-        return wrapped
+        cache = getattr(self, "text_cache", {})
+        key = (id(source), width, wrap, preserve_whitespace)
+        if key in cache and cache[key][0] is source:
+            return cache[key][1]
+        lines = ViewLines(source, width, wrap, preserve_whitespace)
+        if len(cache) >= 4:
+            cache.pop(next(iter(cache)))
+        cache[key] = (source, lines)
+        self.text_cache = cache
+        return lines
 
     def query_match_spans(self, text: str, query: str, filter_error: str = "") -> List[Tuple[int, int]]:
-        """Find all highlight spans for a query. / Находит все диапазоны подсветки для query.
-
-        Args:
-            text: Visible text line.
-            query: Regex query or substring fallback.
-            filter_error: Existing regex error; forces substring fallback.
-        Returns:
-            Non-empty match spans in character offsets.
-        """
         if not query:
             return []
-        if not filter_error:
-            try:
-                pattern = re.compile(query, re.IGNORECASE)
-                return [(start, end) for start, end in (match.span() for match in pattern.finditer(text)) if end > start]
-            except re.error as exc:
-                filter_error = str(exc)
-        lowered_text = text.lower()
-        lowered_query = query.lower()
-        if not lowered_query:
+        if query.startswith("re:"):
+            if not filter_error and not self.query_error(query):
+                matches = self.regex_spans([text], query)
+                if not self.query_error(query):
+                    return matches.get(text, [])
+            query = query[3:]
+        elif query.startswith("lit:"):
+            query = query[4:]
+        if not query:
             return []
-        spans: List[Tuple[int, int]] = []
-        start = 0
-        while True:
-            idx = lowered_text.find(lowered_query, start)
-            if idx < 0:
-                break
-            end = idx + len(query)
-            spans.append((idx, end))
-            start = end
-        return spans
+        # re.escape produces a literal pattern, preserving Unicode match offsets.
+        return [match.span() for match in re.finditer(re.escape(query), text, re.IGNORECASE)]
 
     def search_match_lines(self, lines: Sequence[str], query: str, filter_error: str = "") -> List[int]:
-        """Return line indexes containing search matches. / Возвращает индексы строк с совпадениями."""
         if not query:
             return []
+        key = (id(lines), query, filter_error)
+        cache = getattr(self, "match_lines_cache", {})
+        if key in cache and cache[key][0] is lines:
+            return cache[key][1]
+        if query.startswith("re:") and not filter_error and not self.query_error(query):
+            self.regex_spans(lines, query)
         effective_error = filter_error or self.query_error(query)
-        return [idx for idx, line in enumerate(lines) if self.query_match_spans(line, query, effective_error)]
+        result = [idx for idx, line in enumerate(lines) if self.query_match_spans(line, query, effective_error)]
+        if len(cache) >= 4:
+            cache.pop(next(iter(cache)))
+        cache[key] = (lines, result)
+        self.match_lines_cache = cache
+        return result
 
     def sync_search_query(self, key: str, query: str) -> None:
         """Reset match position when the query changes. / Сбрасывает позицию совпадения при смене query.
@@ -8289,7 +9696,7 @@ class KtopApp:
             self.scroll["logs"] = max(0, len(lines) - area_h)
         scroll = self.adjust_scroll("logs", self.scroll.get("logs", 0), area_h, len(lines), selection_is_scroll=True)
         if self.log_filter_error:
-            self.add(y + 2, x + 2, "Regex fallback to substring: %s" % truncate(self.log_filter_error, width - 36), self.colors.get("red", 0), width - 4)
+            self.add(y + 2, x + 2, "Regex disabled; literal fallback: %s" % truncate(self.log_filter_error, width - 36), self.colors.get("red", 0), width - 4)
         for idx, line in enumerate(lines[scroll : scroll + area_h]):
             self.add_highlighted(y + 3 + idx, x + 2, line, query, width - 4, self.log_filter_error)
         if len(lines) > area_h and area_h > 0:
@@ -8316,7 +9723,7 @@ class KtopApp:
         for idx, line in enumerate(lines[scroll : scroll + area_h]):
             self.add_highlighted(y + idx, x, line, query, width, self.log_filter_error)
 
-    def filtered_viewer_lines(self, width: int) -> List[str]:
+    def filtered_viewer_lines(self, width: int) -> Sequence[str]:
         """Prepare describe/YAML viewer lines without filtering. / Готовит строки describe/YAML без фильтрации.
 
         Args:
@@ -8325,8 +9732,11 @@ class KtopApp:
             Lines ready for the viewer viewport.
         """
         query = self.active_search_query("viewer")
+        lines = self.text_view_lines(self.viewer_lines, width, self.viewer_wrap, preserve_whitespace=True)
+        if query.startswith("re:"):
+            self.regex_spans(lines, query)
         self.viewer_filter_error = self.query_error(query)
-        return self.text_view_lines(self.viewer_lines, width, self.viewer_wrap, preserve_whitespace=True)
+        return lines
 
     def draw_viewer(self, y: int, x: int, height: int, width: int) -> None:
         """Draw framed describe/YAML viewer. / Рисует viewer describe/YAML с рамками."""
@@ -8346,7 +9756,7 @@ class KtopApp:
             self.ensure_search_visible("viewer", lines, area_h, self.viewer_filter_error)
         scroll = self.adjust_scroll("viewer", self.scroll.get("viewer", 0), area_h, len(lines), selection_is_scroll=True)
         if self.viewer_filter_error:
-            self.add(y + 2, x + 2, "Regex fallback to substring: %s" % truncate(self.viewer_filter_error, width - 36), self.colors.get("red", 0), width - 4)
+            self.add(y + 2, x + 2, "Regex disabled; literal fallback: %s" % truncate(self.viewer_filter_error, width - 36), self.colors.get("red", 0), width - 4)
         for idx, line in enumerate(lines[scroll : scroll + area_h]):
             self.add_highlighted(y + 3 + idx, x + 2, line, query, width - 4, self.viewer_filter_error)
         if len(lines) > area_h and area_h > 0:
@@ -8383,11 +9793,11 @@ class KtopApp:
         pos = 0
         for start, end in spans:
             if start > pos:
-                self.add(y, x + pos, value[pos:start], 0, start - pos)
-            self.add(y, x + start, value[start:end], self.colors.get("black_on_yellow", curses.A_REVERSE), end - start)
+                self.add(y, x + cell_width(value[:pos]), value[pos:start], 0, cell_width(value[pos:start]))
+            self.add(y, x + cell_width(value[:start]), value[start:end], self.colors.get("black_on_yellow", curses.A_REVERSE), cell_width(value[start:end]))
             pos = end
         if pos < len(value):
-            self.add(y, x + pos, value[pos:], 0, max(0, width - pos))
+            self.add(y, x + cell_width(value[:pos]), value[pos:], 0, max(0, width - cell_width(value[:pos])))
 
     def draw_text_page(self, y: int, x: int, height: int, width: int, title: str, lines: Sequence[str], key: str) -> None:
         self.box(y, x, height, width, title, focused=True)
@@ -8400,6 +9810,27 @@ class KtopApp:
         if height <= 0:
             return
         hint_y = y + height - 1
+        breadcrumb = " > ".join([entry[0] for entry in self.stack] + [self.page])
+        if self.page in ("pod", "logs") and self.current_pod:
+            breadcrumb += ": " + "/".join(self.current_pod)
+        elif self.page == "node" and self.current_node:
+            breadcrumb += ": " + self.current_node
+        elif self.page == "namespace" and self.current_namespace:
+            breadcrumb += ": " + self.current_namespace
+        with self.jobs_lock:
+            progress = " | ".join("%s loading %.1fs" % (lane, time.monotonic() - job["started"]) for lane, job in self.jobs.items())
+        status = (progress + " | Ctrl-G cancel") if progress else breadcrumb + " | F1 commands"
+        if isinstance(self.client, ReplayClient):
+            status = "OFFLINE %d/%d F5/F6 frames | " % (self.client.index + 1, len(self.client.paths)) + status
+        refresh = self.refresh_state_text()
+        if refresh:
+            status = "Refresh:%s | " % refresh + status
+        if self.page in ("logs", "viewer"):
+            status += " | F2:" + ("Regex" if self.active_search_query(self.page).startswith("re:") else "Literal")
+        if getattr(self.args, "profile_refresh", False):
+            status += " | draw %.1fms %dx%d RSS %dKiB" % (self.draw_seconds * 1000, width, self.stdscr.getmaxyx()[0], resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if height > 1:
+            self.add(y, x, status, self.colors.get("cyan", 0), width)
         if height > 1 and self.message and time.time() < self.message_until:
             self.add(y, x, truncate(self.message, width).ljust(width), self.colors.get("red", 0) if self.message.startswith("ERROR:") else self.colors.get("yellow", 0), width)
         if self.page == "overview":
@@ -8430,6 +9861,7 @@ class KtopApp:
             text = "arrows/PgUp/PgDn scroll | ESC back | q quit"
         self.add(hint_y, x, truncate(text, width).ljust(width), self.colors.get("yellow", 0), width)
 
+    @snapshot_cached()
     def current_nodes(self) -> List[NodeRow]:
         """Return filtered and sorted nodes. / Возвращает отфильтрованные и отсортированные nodes."""
         if not self.snapshot:
@@ -8437,6 +9869,15 @@ class KtopApp:
         nodes = [node for node in self.snapshot.nodes if match_text(node_filter_values(node), self.filters["nodes"])]
         return sort_nodes(nodes, self.node_sort[0], self.node_sort[1])
 
+    def pods_by_namespace(self) -> Dict[str, List[PodRow]]:
+        if getattr(self, "indexed_snapshot", None) is not self.snapshot:
+            self.indexed_snapshot = self.snapshot
+            self.namespace_pod_index = {}
+            for pod in self.snapshot.pods if self.snapshot else []:
+                self.namespace_pod_index.setdefault(pod.namespace, []).append(pod)
+        return getattr(self, "namespace_pod_index", {})
+
+    @snapshot_cached()
     def all_namespace_rows(self) -> List[NamespaceRow]:
         """Build namespace aggregates from the current snapshot. / Строит namespace aggregates из текущего snapshot.
 
@@ -8448,18 +9889,18 @@ class KtopApp:
         snap = self.snapshot
         names = set(snap.namespaces or [])
         names.update(pod.namespace for pod in snap.pods if pod.namespace)
-        cpu_total = sum(node.alloc_cpu_m for node in snap.nodes)
-        mem_total = sum(node.alloc_mem_b for node in snap.nodes)
+        cpu_total = finite_sum(node.alloc_cpu_m for node in snap.nodes)
+        mem_total = finite_sum(node.alloc_mem_b for node in snap.nodes)
         rows: List[NamespaceRow] = []
         bad_statuses = {"CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "Pending", "Failed", "Evicted", "Error", "Unknown", "Terminating", "NotReady"}
         for name in sorted(names):
-            pods = [pod for pod in snap.pods if pod.namespace == name]
+            pods = self.pods_by_namespace().get(name, [])
             cpu_current = sum(self.display_usage(pod.usage_cpu_m, pod.requested_cpu_m, pod.cpu_history) for pod in pods)
             mem_current = sum(self.display_usage(pod.usage_mem_b, pod.requested_mem_b, pod.mem_history) for pod in pods)
             rows.append(
                 NamespaceRow(
                     name=name,
-                    status=snap.namespace_statuses.get(name, "Active"),
+                    status=snap.namespace_statuses.get(name, "Unknown"),
                     pods_count=len(pods),
                     running_pods=sum(1 for pod in pods if pod.status == "Running"),
                     ready=sum(pod.ready for pod in pods),
@@ -8488,11 +9929,13 @@ class KtopApp:
             )
         return rows
 
+    @snapshot_cached()
     def current_namespace_rows(self) -> List[NamespaceRow]:
         """Return filtered and sorted namespace rows. / Возвращает отфильтрованные и отсортированные namespace rows."""
         rows = [row for row in self.all_namespace_rows() if match_text(namespace_filter_values(row), self.filters["overview_namespaces"])]
         return sort_namespaces(rows, self.namespace_sort[0], self.namespace_sort[1])
 
+    @snapshot_cached()
     def current_pods(self, ignore_namespace_filter: bool = False) -> List[PodRow]:
         """Return filtered and sorted pods. / Возвращает отфильтрованные и отсортированные pods.
 
@@ -8507,25 +9950,28 @@ class KtopApp:
         ns_filter = "" if ignore_namespace_filter else self.filters["namespace"]
         if ns_filter:
             if ns_filter in (self.snapshot.namespaces or []):
-                pods = [pod for pod in pods if pod.namespace == ns_filter]
+                pods = self.pods_by_namespace().get(ns_filter, [])
             else:
                 pods = [pod for pod in pods if ns_filter.lower() in pod.namespace.lower()]
         pods = [pod for pod in pods if match_text(pod_filter_values(pod), self.filters["pods"])]
         return sort_pods(pods, self.pod_sort[0], self.pod_sort[1])
 
+    @snapshot_cached()
     def current_namespace_pods(self, namespace: str) -> List[PodRow]:
         """Return pods for one namespace with pod text filter. / Возвращает pods одного namespace с фильтром pod."""
         if not self.snapshot:
             return []
-        pods = [pod for pod in self.snapshot.pods if pod.namespace == namespace and match_text(pod_filter_values(pod), self.filters["pods"])]
+        pods = [pod for pod in self.pods_by_namespace().get(namespace, []) if match_text(pod_filter_values(pod), self.filters["pods"])]
         return sort_pods(pods, self.pod_sort[0], self.pod_sort[1])
 
+    @snapshot_cached(timed=True)
     def all_cronjob_rows(self) -> List[CronJobRow]:
         """Return all CronJob diagnostic rows. / Возвращает все строки диагностики CronJob."""
         if not self.snapshot:
             return []
         return build_cronjob_rows(self.snapshot)
 
+    @snapshot_cached(timed=True)
     def current_cronjobs(self) -> List[CronJobRow]:
         """Return filtered and sorted CronJob rows. / Возвращает filtered/sorted CronJob rows."""
         rows = [row for row in self.all_cronjob_rows() if match_text(cronjob_filter_values(row), self.filters["cronjobs"])]
@@ -8687,23 +10133,26 @@ class KtopApp:
             target: Optional explicit object target.
             push: Whether to push a new navigation page.
         """
+        if target is None and self.selected.get(self.current_table_key(), 0) < 0:
+            self.flash("No selected object; use arrows")
+            return
         target = target or self.selected_object_target()
         if not target:
             self.flash("no object selected", error=True)
             return
+        if self.viewer_target != target or self.viewer_mode != mode:
+            self.viewer_lines = []
         self.viewer_mode = "yaml" if mode == "yaml" else "describe"
         self.viewer_target = target
         self.viewer_title = "%s: %s" % ("YAML" if self.viewer_mode == "yaml" else "Describe", target.label)
-        try:
-            if self.viewer_mode == "yaml":
-                self.viewer_lines = self.client.yaml_object(target.kind, target.namespace, target.name)
-            else:
-                self.viewer_lines = self.client.describe_object(target.kind, target.namespace, target.name)
-            if target.container:
-                self.viewer_lines = ["# selected container: %s" % target.container, ""] + self.viewer_lines
-        except DataError as exc:
-            self.viewer_lines = ["ERROR: %s" % exc]
-            self.flash(str(exc), error=True, ttl=6.0)
+        if push and self.page != "viewer":
+            self.push_page("viewer")
+        mode = self.viewer_mode
+        def load() -> List[str]:
+            method = self.client.yaml_object if mode == "yaml" else self.client.describe_object
+            lines = method(target.kind, target.namespace, target.name)
+            return (["# selected container: %s" % target.container, ""] if target.container else []) + lines
+        self.start_job("viewer", (mode, target), load, lambda lines: setattr(self, "viewer_lines", lines))
         self.viewer_filter_error = ""
         self.scroll["viewer"] = 0
         if push and self.page != "viewer":
@@ -8725,7 +10174,7 @@ class KtopApp:
             if event.kind == kind and event.name == name and (not namespace or event.namespace == namespace)
         ]
 
-    def filtered_log_lines(self, width: int) -> List[str]:
+    def filtered_log_lines(self, width: int) -> Sequence[str]:
         """Prepare loaded log lines without filtering. / Готовит log lines без фильтрации.
 
         Args:
@@ -8734,8 +10183,138 @@ class KtopApp:
             Lines ready for log viewport rendering.
         """
         query = self.active_search_query("logs")
+        lines = self.text_view_lines(self.log_lines, width, self.log_wrap, preserve_whitespace=False)
+        if query.startswith("re:"):
+            self.regex_spans(lines, query)
         self.log_filter_error = self.query_error(query)
-        return self.text_view_lines(self.log_lines, width, self.log_wrap, preserve_whitespace=False)
+        return lines
+
+    def palette_commands(self) -> List[Tuple[str, Callable[[], None]]]:
+        commands = [
+            ("Refresh snapshot", lambda: self.refresh_snapshot(force=True)),
+            ("Health", lambda: self.push_page("health")),
+            ("Resource risk", lambda: self.push_page("resources")),
+            ("CronJobs", lambda: self.push_page("cronjobs")),
+            ("Sources and timestamps", lambda: self.push_page("sources")),
+            ("Diagnostics", self.open_diagnostics),
+            ("Network Service/EndpointSlice/Pod", lambda: self.push_page("network")),
+            ("Degradation evidence", lambda: self.push_page("degradation")),
+            ("Incident timeline", lambda: self.push_page("timeline")),
+            ("Workload securityContext", lambda: self.push_page("security")),
+            ("Describe selected", lambda: self.open_object_viewer("describe")),
+            ("YAML selected", lambda: self.open_object_viewer("yaml")),
+            ("Toggle Literal/Regex search", self.toggle_search_mode),
+            ("Cancel background action", self.cancel_action),
+            ("Columns compact", lambda: self.set_columns(True)),
+            ("Columns full", lambda: self.set_columns(False)),
+            ("Save preset default (or type save NAME)", lambda: self.preset_action("save", "default")),
+            ("Load preset default (or type load NAME)", lambda: self.preset_action("load", "default")),
+        ]
+        return [(label, action) for label, action in commands if self.palette_query.casefold() in label.casefold()]
+
+    def set_columns(self, compact: bool) -> None:
+        self.args.node_columns = "NAME,STATUS,CPU,MEM" if compact else ""
+        self.args.pod_columns = "NAMESPACE,POD,STATUS,CPU,MEMORY" if compact else ""
+        self.hscroll = {key: 0 for key in self.hscroll}
+
+    def toggle_search_mode(self) -> None:
+        key = self.page if self.page in ("logs", "viewer") else None
+        if key is None:
+            self.flash("Literal/Regex toggle is available in logs and viewer")
+            return
+        query = self.active_search_query(key)
+        if query.startswith("re:"):
+            literal = query[3:]
+            toggled = "lit:" + literal if literal.startswith("re:") else literal
+        else:
+            toggled = "re:" + (query[4:] if query.startswith("lit:") else query)
+        if self.editing_filter == key:
+            self.filter_buffer = toggled
+        else:
+            self.filters[key] = toggled
+        self.flash("Search: " + ("Regex" if toggled.startswith("re:") else "Literal"))
+
+    def preset_action(self, action: str, name: str) -> None:
+        try:
+            if not name or len(name) > 64:
+                raise ValueError("preset name must be 1..64 characters")
+            path = os.path.abspath(self.args.preset_file)
+            presets = {}
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as stream:
+                    text = stream.read(65537)
+                if len(text) > 65536:
+                    raise ValueError("preset file exceeds 64KiB")
+                presets = json.loads(text)
+                if not isinstance(presets, dict):
+                    raise ValueError("expected preset object")
+            if action == "save":
+                presets[name] = {"filters": self.filters.copy(), "node_columns": self.args.node_columns,
+                                 "pod_columns": self.args.pod_columns, "overview_mode": self.overview_mode}
+                text = json.dumps(presets, ensure_ascii=False, indent=2) + "\n"
+                if len(text.encode("utf-8")) > 65536:
+                    raise ValueError("preset file exceeds 64KiB")
+                fd, temporary = tempfile.mkstemp(prefix=".ktop-preset-", dir=os.path.dirname(path))
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                        stream.write(text)
+                    os.replace(temporary, path)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            else:
+                preset = presets[name]
+                filters = preset["filters"]
+                if not isinstance(filters, dict) or any(not isinstance(v, str) or len(v) > 4096 for v in filters.values()):
+                    raise ValueError("invalid preset filters")
+                for key, allowed in (("node_columns", NODE_COLUMNS), ("pod_columns", POD_COLUMNS)):
+                    value = preset.get(key, "")
+                    if not isinstance(value, str) or any(c not in allowed for c in value.split(",") if c):
+                        raise ValueError("invalid preset columns")
+                if getattr(self.args, "namespace_only", False) and filters.get("namespace") != self.args.namespace:
+                    raise ValueError("preset cannot change namespace-only scope")
+                self.args.node_columns, self.args.pod_columns = preset.get("node_columns", ""), preset.get("pod_columns", "")
+                self.filters.update({k: v for k, v in filters.items() if k in self.filters})
+                self.overview_mode = "namespaces" if preset.get("overview_mode") == "namespaces" else "nodes"
+                if isinstance(self.client, KubectlClient):
+                    self.client.queue_namespace_scope(self.filters["namespace"])
+                    self.last_refresh = 0
+                self.reset_selections()
+            self.flash("Preset %s: %s" % (action, name))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.flash("Preset: %s" % exc, error=True)
+
+    def handle_palette_key(self, ch: Any) -> None:
+        if is_escape_key(ch):
+            self.palette_open = False
+        elif ch in (curses.KEY_UP, curses.KEY_DOWN):
+            count = len(self.palette_commands())
+            self.palette_index = max(0, min(max(0, count - 1), self.palette_index + (1 if ch == curses.KEY_DOWN else -1)))
+        elif is_enter_key(ch):
+            self.palette_open = False
+            parts = self.palette_query.split(" ", 1)
+            if len(parts) == 2 and parts[0].lower() in ("save", "load"):
+                self.preset_action(parts[0].lower(), parts[1].strip())
+            else:
+                commands = self.palette_commands()
+                if commands:
+                    commands[min(self.palette_index, len(commands) - 1)][1]()
+        elif ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            self.palette_query = self.palette_query[:-1]
+            self.palette_index = 0
+        elif isinstance(ch, str) and ch.isprintable() and len(self.palette_query) < 128:
+            self.palette_query += ch
+            self.palette_index = 0
+
+    def draw_palette(self) -> None:
+        height, width = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+        self.add(0, 0, "Command > " + self.palette_query + "_", curses.A_BOLD, width)
+        commands = self.palette_commands()
+        start = max(0, self.palette_index - max(1, height - 3) + 1)
+        for index, (label, _) in enumerate(commands[start:start + max(0, height - 2)], start):
+            self.add(index - start + 1, 0, label, curses.A_REVERSE if index == self.palette_index else 0, width)
+        self.add(height - 1, 0, "Enter run | arrows select | Esc close | save/load NAME", 0, width)
 
     def handle_key(self, ch: Any) -> bool:
         """Dispatch one input key. / Обрабатывает одну нажатую клавишу.
@@ -8745,10 +10324,31 @@ class KtopApp:
         Returns:
             True when the application should quit.
         """
+        if ch in (curses.KEY_F5, curses.KEY_F6) and isinstance(self.client, ReplayClient):
+            try:
+                self.cancel_jobs()
+                self.pending_snapshot = self.client.step(-1 if ch == curses.KEY_F5 else 1)
+                self.poll_results()
+                self.flash("Offline replay %d/%d" % (self.client.index + 1, len(self.client.paths)))
+            except DataError as exc:
+                self.flash(str(exc), error=True)
+            return False
+        if self.palette_open:
+            self.handle_palette_key(ch)
+            return False
+        if ch == curses.KEY_F2:
+            self.toggle_search_mode()
+            return False
         if self.editing_filter:
             self.handle_filter_key(ch)
             return False
         key = hotkey(ch)
+        if key == ":" or ch == curses.KEY_F1:
+            self.palette_open, self.palette_query, self.palette_index = True, "", 0
+            return False
+        if ch == "\x07":
+            self.cancel_action()
+            return False
         if key == "q" or is_ctrl_c(ch):
             return True
         if is_escape_key(ch):
@@ -8758,6 +10358,10 @@ class KtopApp:
             return False
         if ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
             self.handle_motion(ch)
+            self.remember_selection()
+            return False
+        if (is_enter_key(ch) or key in ("d", "y")) and self.selected.get(self.current_table_key(), 0) < 0:
+            self.flash("No selected object; select a row with arrows")
             return False
         if is_enter_key(ch):
             self.handle_enter()
@@ -8777,7 +10381,7 @@ class KtopApp:
         if key == "z":
             self.push_page("resources")
             return False
-        if key == "x":
+        if key == "x" and self.page != "cronjobs":
             self.open_diagnostics()
             return False
         if key == "?":
@@ -8913,6 +10517,14 @@ class KtopApp:
             amount = -1
         elif ch == curses.KEY_DOWN:
             amount = 1
+        height, width = self.stdscr.getmaxyx()
+        if (width < 80 or height < 30) and self.page in ("health", "resources"):
+            lines = self.health_lines() if self.page == "health" else self.resource_risk_lines()
+            self.move_scroll(self.page, ch, amount, len(lines))
+            return
+        if self.page in ("network", "degradation", "timeline", "security"):
+            self.move_scroll(self.page, ch, amount, len(self.incident_lines(self.page)))
+            return
         if self.page == "overview":
             key = self.focus if self.focus in ("nodes", "overview_namespaces", "pods") else "nodes"
             if key == "nodes":
@@ -8953,13 +10565,15 @@ class KtopApp:
             self.move_health_scroll(self.health_focus, ch, amount, self.health_panel_row_count(self.health_focus, self.health_data()))
         elif self.page == "namespaces":
             self.move_selected("namespaces", ch, amount, len(self.namespace_rows()))
-        elif self.page in ("help", "health", "owner", "diagnostics"):
+        elif self.page in ("help", "health", "owner", "diagnostics", "sources"):
             if self.page == "help":
                 lines = help_lines()
             elif self.page == "health":
                 lines = self.health_lines()
             elif self.page == "owner":
                 lines = self.owner_lines()
+            elif self.page == "sources":
+                lines = self.source_lines()
             else:
                 lines = self.diagnostics_cache
             self.move_scroll(self.page, ch, amount, len(lines))
@@ -9248,6 +10862,7 @@ class KtopApp:
         self.filter_buffer = self.filters.get(key, "")
 
     def reset_selections(self) -> None:
+        self.selection_ids = {}
         for key in self.selected:
             self.selected[key] = 0
         for key in self.scroll:
@@ -9274,6 +10889,8 @@ class KtopApp:
             cronjob_key: Optional current CronJob key.
             container_name: Optional current container.
         """
+        self.cancel_jobs()
+        self.demand_details(page)
         self.stack.append((self.page, self.current_node, self.current_pod, self.current_container, self.current_cronjob))
         self.page = page
         if node_name:
@@ -9310,6 +10927,7 @@ class KtopApp:
             self.scroll[page] = 0
 
     def pop_page(self) -> None:
+        self.cancel_jobs()
         if self.stack:
             self.page, self.current_node, self.current_pod, self.current_container, self.current_cronjob = self.stack.pop()
         else:
@@ -9327,13 +10945,10 @@ class KtopApp:
         self.scroll["namespaces"] = 0
 
     def open_diagnostics(self) -> None:
-        self.diagnostics_cache = ["Running diagnostics..."]
         if self.page != "diagnostics":
             self.push_page("diagnostics")
-        try:
-            self.diagnostics_cache = self.client.diagnostics_lines()
-        except DataError as exc:
-            self.diagnostics_cache = ["Metrics / RBAC diagnostics", "", "FAIL   diagnostics %s" % exc]
+        self.start_job("diagnostics", ("diagnostics",), self.client.diagnostics_lines,
+                       lambda lines: setattr(self, "diagnostics_cache", lines))
         self.scroll["diagnostics"] = 0
 
     def cycle_log_container(self, direction: int) -> None:
@@ -9357,19 +10972,13 @@ class KtopApp:
         pod = self.find_pod(self.current_pod)
         if not pod or not self.current_container:
             return
-        try:
-            self.log_lines = self.client.get_logs(
-                pod.namespace,
-                pod.name,
-                self.current_container,
-                self.log_tail,
-                self.log_timestamps,
-                previous=self.log_previous,
-            )
-            self.last_log_refresh = time.time()
-        except DataError as exc:
-            self.log_lines = ["ERROR: %s" % exc]
-            self.last_log_refresh = time.time()
+        identity = (pod.namespace, pod.name, safe_get(pod.raw, ["metadata", "uid"], ""),
+                    self.current_container, self.log_tail, self.log_timestamps, self.log_previous)
+        namespace, name, _, container, tail, timestamps, previous = identity
+        self.last_log_refresh = time.time()
+        self.start_job("logs", identity,
+                       lambda: self.client.get_logs(namespace, name, container, tail, timestamps, previous=previous),
+                       lambda lines: setattr(self, "log_lines", lines))
 
     def adjust_scroll(self, key: str, selected: int, page_size: int, count: int, selection_is_scroll: bool = False) -> int:
         """Keep scroll offset inside visible range. / Удерживает scroll offset в видимом диапазоне.
@@ -9408,6 +11017,8 @@ class KtopApp:
         return 0
 
     def resource_attr(self, value_ratio: float) -> int:
+        if not math.isfinite(value_ratio):
+            return 0
         if value_ratio >= 0.9:
             return self.colors.get("red", 0)
         if value_ratio >= 0.5:
@@ -9416,20 +11027,22 @@ class KtopApp:
 
     def bar(self, width: int, value_ratio: float) -> str:
         width = max(3, width)
+        if not math.isfinite(value_ratio):
+            return "[" + " " * width + "]"
         fill = int(round(max(0.0, min(1.0, value_ratio)) * width))
         return "[" + (self.graph_bar_char() * fill).ljust(width) + "]"
 
     def trend_or_bar(self, history: Sequence[float], value_ratio: float, width: int = 10, total: float = 0.0) -> str:
-        clean = [float(value or 0.0) for value in history if math.isfinite(float(value or 0.0))]
+        clean = list(history)
         if clean:
             current = clean[-1]
             scale_total = total if total > 0 else current / value_ratio if value_ratio > 0 and current > 0 else 1.0
-            return "[" + self.graph_line(clean, current, width, scale_total) + "]"
+            return "[" + self.graph_line(history, current, width, scale_total) + "]"
         return self.bar(width, value_ratio)
 
     def history_arrow(self, history: Sequence[float]) -> str:
-        clean = [float(value or 0.0) for value in history if math.isfinite(float(value or 0.0))]
-        if len(clean) < 2:
+        clean = list(history)
+        if len(clean) < 2 or not all(math.isfinite(v) for v in clean[-2:]):
             return " "
         delta = clean[-1] - clean[-2]
         baseline = max(abs(clean[-2]), 1.0)
@@ -9438,9 +11051,7 @@ class KtopApp:
         return "↑" if delta > 0 else "↓"
 
     def display_usage(self, usage: float, fallback: float, history: Sequence[float]) -> float:
-        if history:
-            return float(usage or 0.0)
-        return float(usage or fallback or 0.0)
+        return float(usage)
 
     def trend_value(self, history: Sequence[float], value: float, formatter: Any, width: int = 6) -> str:
         del width
@@ -9475,7 +11086,8 @@ class KtopApp:
         Returns:
             Positive scale denominator.
         """
-        high = max(max(values), 1.0) if values else 1.0
+        finite_values = [value for value in values if math.isfinite(value)]
+        high = max(max(finite_values), 1.0) if finite_values else 1.0
         if total > 0:
             return max(total, 1.0)
         if sample_count <= 1:
@@ -9507,6 +11119,12 @@ class KtopApp:
         """
         height = max(1, int(height))
         width = max(1, int(width))
+        if isinstance(history, TimedHistory) and history.timestamps and height >= 3:
+            first, last = history.timestamps[0], history.timestamps[-1]
+            axis = "%s — %s (%.0fs; gaps=N/A)" % (
+                time.strftime("%H:%M:%S", time.localtime(first)), time.strftime("%H:%M:%S", time.localtime(last)), last - first)
+            self.add(y + height - 1, x, axis, self.colors.get("cyan", 0), width)
+            height -= 1
         sample_count = len([value for value in history if math.isfinite(float(value or 0.0))])
         values = self.chart_values(history, current, width)
         if not values:
@@ -9520,6 +11138,8 @@ class KtopApp:
         # Padding слева означает неизвестное прошлое; реальные нули рисуем baseline.
         actual_start = max(0, width - actual_count)
         for col, value in enumerate(values[-width:]):
+            if not math.isfinite(value):
+                continue
             is_padding = col < actual_start
             units = int(round((max(0.0, value) / high) * max_units))
             if value > 0:
@@ -9553,7 +11173,7 @@ class KtopApp:
         levels = self.graph_levels()
         scale = float(len(levels) - 1) / high
         max_index = len(levels) - 1
-        return "".join(levels[max(0, min(max_index, int(round(max(0.0, value) * scale))))] for value in values[-width:])
+        return "".join(levels[max(0, min(max_index, int(round(max(0.0, value) * scale))))] if math.isfinite(value) else " " for value in values[-width:])
 
     def box(self, y: int, x: int, height: int, width: int, title: str = "", focused: bool = False) -> None:
         if height <= 0 or width <= 0:
@@ -9592,6 +11212,10 @@ def help_lines() -> List[str]:
         Lines shown on the help page.
     """
     return [
+        "F1: Network / Degradation / Incident timeline / Workload securityContext",
+        "Offline: --replay snapshots.json; F5/F6 frames; --diff BEFORE AFTER",
+        "F1 or : commands | F2 Literal/Regex (logs/viewer) | Ctrl-G cancel",
+        "Palette: save NAME / load NAME; Columns compact/full; Sources and timestamps",
         "ktop-py.py controls",
         "Latin hotkeys also accept CapsLock and Russian ЙЦУКЕН letters on the same physical keys.",
         "For Russian layout, the physical / key is accepted as . or , for filters.",
@@ -9636,7 +11260,7 @@ def help_lines() -> List[str]:
         "  r                 reload selected object",
         "  w                 toggle wrapping",
         "  f                 toggle plain copy mode without frames/header/footer",
-        "  /                 live regex search and highlight; invalid regex falls back to substring",
+        "  /                 literal search; re:pattern enables bounded regex; lit: escapes the prefix",
         "  n / p             next / previous match",
         "  g / b             top / bottom",
         "",
@@ -9648,7 +11272,7 @@ def help_lines() -> List[str]:
         "  w                 toggle wrapping",
         "  f                 toggle plain copy mode without frames/header/footer",
         "  m                 load 100 more lines",
-        "  /                 live regex search and highlight; invalid regex falls back to substring",
+        "  /                 literal search; re:pattern enables bounded regex; lit: escapes the prefix",
         "  n / p             next / previous match while search is active",
         "  g / b             top / bottom",
         "",
@@ -9684,10 +11308,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="ktop-py.py",
-        description="Single-file Python 3.8 Kubernetes top-like TUI inspired by ktop.",
+        description="Single-file Python 3.8+ Kubernetes top-like TUI inspired by ktop.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--kubeconfig", help="Path to kubeconfig passed to kubectl")
+    parser.add_argument("--namespace-only", action="store_true", help="Collect only namespaced resources; requires -n, defaults to metrics-server")
+    parser.add_argument("--max-output-bytes", type=parse_positive_int, default=DEFAULT_MAX_OUTPUT_BYTES, help="Combined stdout/stderr byte limit per kubectl command")
+    parser.add_argument("--log-limit-bytes", type=parse_positive_int, default=DEFAULT_LOG_LIMIT_BYTES, help="Maximum bytes requested for container logs")
+    parser.add_argument("--max-metric-series", type=parse_positive_int, default=DEFAULT_MAX_METRIC_SERIES, help="Maximum series in each metric cache")
+    parser.add_argument("--max-history-points", type=parse_positive_int, default=DEFAULT_MAX_HISTORY_POINTS, help="Maximum total retained timestamp/value pairs")
+    parser.add_argument("--label-selector", default="", help="Server-side pod label selector")
+    parser.add_argument("--field-selector", default="", help="Server-side pod field selector")
+    parser.add_argument("--scrape-deadline", type=parse_duration_seconds, default=30.0, help="Total deadline for an endpoint batch")
+    parser.add_argument("--preset-file", default=".ktop-presets.json", help="Preset JSON path; written only by palette save")
     parser.add_argument("--context", help="Kubeconfig context passed to kubectl")
     parser.add_argument("-n", "--namespace", default=None, help="Namespace to display")
     parser.add_argument(
@@ -9708,12 +11341,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--show-all-columns", action="store_true", default=True, help="Compatibility flag; all columns are shown unless column lists are provided")
     parser.add_argument("--refresh-interval", type=float, default=DEFAULT_REFRESH_SECONDS, help="TUI refresh interval in seconds")
     parser.add_argument("--secondary-refresh-interval", type=parse_duration_seconds, default=DEFAULT_SECONDARY_REFRESH_SECONDS, help="TTL for workloads, policies, volumes, and events; accepts seconds or 15s/5m/1h suffixes")
-    parser.add_argument("--kubectl-parallelism", type=parse_positive_int, default=DEFAULT_KUBECTL_PARALLELISM, help="Maximum parallel kubectl requests for secondary resources")
-    parser.add_argument("--profile-refresh", action="store_true", help="Append per-command kubectl refresh timings to snapshot warnings")
+    parser.add_argument("--kubectl-parallelism", type=parse_positive_int, default=DEFAULT_KUBECTL_PARALLELISM, help="Global maximum concurrent kubectl requests (all collectors and UI actions)")
+    parser.add_argument("--profile-refresh", action="store_true", help="Report command/parse/build timings, RSS peak, histories and TUI draw timings")
     parser.add_argument("--request-timeout", default="8s", help="kubectl --request-timeout value")
     parser.add_argument("--command-timeout", type=float, default=12.0, help="subprocess timeout for kubectl commands")
     parser.add_argument("--kubectl", default=os.environ.get("KUBECTL", "kubectl"), help="kubectl executable path")
-    parser.add_argument("--log-tail", type=int, default=200, help="Initial kubectl logs --tail value")
+    parser.add_argument("--log-tail", type=int, default=200, help="Initial kubectl logs --tail value (also bounded by --log-limit-bytes)")
     parser.add_argument("--demo", action="store_true", help="Run with synthetic data and no kubectl")
     parser.add_argument("--dump", action="store_true", help="Print one snapshot and exit")
     parser.add_argument("--output", choices=["text", "json"], default="text", help="Output format for --dump")
@@ -9725,6 +11358,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dump-graph-width", type=parse_positive_int, default=DEFAULT_DUMP_GRAPH_WIDTH, help="Default sample window for dump max values")
     parser.add_argument("--dump-max-interval", type=parse_duration_seconds, default=0.0, help="Max-value window duration for --dump, e.g. 30s/5m; 0 uses --dump-graph-width samples without extra collection")
     parser.add_argument("--diagnostics", action="store_true", help="Run Metrics/RBAC diagnostics and exit")
+    parser.add_argument("--replay", nargs="+", metavar="SNAPSHOT", help="Offline JSON replay; F5/F6 move between files")
+    parser.add_argument("--diff", nargs=2, metavar=("BEFORE", "AFTER"), help="Compare versioned snapshots by UID and time; never contacts Kubernetes")
+    parser.add_argument("--support-bundle", metavar="PATH", help="Write a masked JSON support bundle with mode 0600")
+    parser.add_argument("--bundle-namespace", action="append", default=[], metavar="NAME", help="Include this namespace in bundle; repeatable")
+    parser.add_argument("--bundle-object", action="append", default=[], metavar="KIND/NS/NAME", help="Include this object in bundle; repeatable; Node//name for nodes")
     parser.add_argument("--self-test", action="store_true", help="Run built-in tests that do not require Kubernetes")
     parser.add_argument("--version", action="store_true", help="Print version and exit")
     return parser
@@ -9747,6 +11385,26 @@ def normalize_display_scope(args: argparse.Namespace, parser: Optional[argparse.
         if parser is not None:
             parser.error(message)
         raise argparse.ArgumentTypeError(message)
+    if getattr(args, "namespace_only", False):
+        if not args.namespace or explicit_all_namespaces:
+            message = "--namespace-only requires --namespace and cannot use --all-namespaces"
+            if parser is not None:
+                parser.error(message)
+            raise argparse.ArgumentTypeError(message)
+        if args.metrics_source in ("prometheus", "prom"):
+            if getattr(args, "metrics_source_explicit", False):
+                message = "--namespace-only supports --metrics-source metrics-server or none"
+                if parser is not None:
+                    parser.error(message)
+                raise argparse.ArgumentTypeError(message)
+            args.metrics_source = "metrics-server"
+    for field_name in ("command_timeout", "refresh_interval"):
+        value = getattr(args, field_name, 1.0)
+        if not math.isfinite(value) or value <= 0:
+            message = "%s must be positive and finite" % field_name.replace("_", "-")
+            if parser is not None:
+                parser.error(message)
+            raise argparse.ArgumentTypeError(message)
     args.all_namespaces = explicit_all_namespaces or not bool(args.namespace)
     return args
 
@@ -9827,16 +11485,17 @@ def run_self_test() -> int:
     assert percentile([180.0, 120.0], 95.0) == 180.0
     chart_app = object.__new__(KtopApp)
     chart_app.rate_chart_peaks = {}
-    assert chart_app.chart_values([5.0], 5.0, 4) == [0.0, 0.0, 0.0, 5.0]
-    assert chart_app.chart_values([2.0, 3.0], 3.0, 5) == [0.0, 0.0, 0.0, 2.0, 3.0]
+    assert chart_app.chart_values([5.0], 5.0, 4)[-1] == 5.0
+    assert all(math.isnan(v) for v in chart_app.chart_values([5.0], 5.0, 4)[:-1])
+    assert chart_app.chart_values([2.0, 3.0], 3.0, 5)[-2:] == [2.0, 3.0]
     assert chart_app.rate_chart_scale(("cluster", "net"), [10.0], 20.0) == RATE_CHART_MIN_BYTES_PER_SECOND
     assert chart_app.rate_chart_scale(("cluster", "net"), [1024.0 * 1024.0], 20.0) == 1024.0 * 1024.0
     assert chart_app.rate_scale_title(1024.0) == "max:1Ki/s"
     chart_app.args = argparse.Namespace(graph_style="unicode")
-    assert chart_app.trend_or_bar([20.0, 40.0], 0.2, 4) == "[▁▁▂▂]"
+    assert chart_app.trend_or_bar([20.0, 40.0], 0.2, 4) == "[  ▂▂]"
     assert chart_app.trend_or_bar([], 0.25, 4) == "[▁   ]"
-    assert chart_app.trend_or_bar([0.0, 133.0, 0.0], 0.0, 4, total=2000.0) == "[▁▁▁▁]"
-    assert chart_app.graph_line([10.0, 200.0], 10.0, 4, 100.0) == "▁▁▂█"
+    assert chart_app.trend_or_bar([0.0, 133.0, 0.0], 0.0, 4, total=2000.0) == "[ ▁▁▁]"
+    assert chart_app.graph_line([10.0, 200.0], 10.0, 4, 100.0) == "  ▂█"
     assert chart_app.chart_sample_count([0.0, 0.0], 0.0, 4) == 2
 
     class FakeScreen:
@@ -9958,12 +11617,12 @@ def run_self_test() -> int:
     hist_client.add_history_sample(hist_key, 100.0, 1.0)
     hist_client.add_history_sample(hist_key, 101.0, 2.0)
     hist_client.add_history_sample(hist_key, 102.0, 3.0)
-    assert history_values(hist_client.metric_history, hist_key) == [2.0, 3.0]
+    assert history_values(hist_client.current_metric_history(), hist_key) == [2.0, 3.0]
     gauge_key = history_key_pod("default", "web", "mem")
     hist_client.add_gauge_history_sample(gauge_key, 103.0, 0.0)
-    assert gauge_key not in hist_client.metric_history
+    assert history_values(hist_client.current_metric_history(), gauge_key) == [0.0]
     hist_client.add_gauge_history_sample(gauge_key, 104.0, parse_bytes("64Mi"))
-    assert history_values(hist_client.metric_history, gauge_key) == [parse_bytes("64Mi")]
+    assert history_values(hist_client.current_metric_history(), gauge_key) == [0.0, parse_bytes("64Mi")]
     node_metrics_a: Dict[str, ResourceUsage] = {}
     pod_metrics_a: Dict[Tuple[str, str], ResourceUsage] = {}
     container_metrics_a: Dict[Tuple[str, str, str], ResourceUsage] = {}
@@ -10083,26 +11742,25 @@ def run_self_test() -> int:
         if list(command) == ["config", "current-context"]:
             return "test-context\n"
         if list(command)[:2] == ["config", "view"]:
-            return '{"contexts":[{"context":{"user":"test-user"}}]}'
+            return 'test-user'
         return '{"serverVersion":{"gitVersion":"v1.test"}}'
 
     cluster_client.run = fake_cluster_run  # type: ignore[assignment]
     assert cluster_client.cluster_info([]) == ("test-context", "test-user", "v1.test")
     assert cluster_client.cluster_info([]) == ("test-context", "test-user", "v1.test")
-    assert len(cluster_commands) == 3
+    assert len(cluster_commands) == 4
 
     timing_client = KubectlClient(performance_args)
-    original_subprocess_run = subprocess.run
+    original_bounded_command = globals()["bounded_command"]
 
-    def fake_subprocess_run(command: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
-        del kwargs
-        return subprocess.CompletedProcess(list(command), 0, '{"items":[]}', "")
+    def fake_bounded_command(command: Sequence[str], timeout: float, max_output: int, input_bytes: Optional[bytes] = None, cancel: Optional[threading.Event] = None) -> Tuple[int, bytes, bytes]:
+        return 0, b'{"items":[]}', b""
 
     try:
-        subprocess.run = fake_subprocess_run  # type: ignore[assignment]
+        globals()["bounded_command"] = fake_bounded_command
         assert timing_client.run(["get", "nodes"]) == '{"items":[]}'
     finally:
-        subprocess.run = original_subprocess_run  # type: ignore[assignment]
+        globals()["bounded_command"] = original_bounded_command
     assert len(timing_client.command_timings) == 1
     assert timing_client.command_timings[0].status == "ok"
     assert timing_client.command_timings[0].stdout_bytes == len('{"items":[]}')
@@ -10117,14 +11775,15 @@ def run_self_test() -> int:
         return {"items": []}, []
 
     secondary_client.fetch_secondary_resource = fake_secondary_fetch  # type: ignore[assignment]
-    assert len(secondary_client.load_secondary_resources([])) == 12
-    assert len(secondary_calls) == 12
+    assert len(secondary_client.load_secondary_resources([])) == 16
+    assert len(secondary_calls) == 16
     secondary_client.load_secondary_resources([])
-    assert len(secondary_calls) == 12
+    assert len(secondary_calls) == 16
     secondary_client.load_secondary_resources([], force=True)
-    assert len(secondary_calls) == 24
+    assert len(secondary_calls) == 32
 
     progressive_client = KubectlClient(performance_args)
+    progressive_client.pin_context = lambda: None  # type: ignore[assignment]
     progressive_client.ensure_available = lambda: None  # type: ignore[assignment]
     progressive_client.load_primary_resources = lambda warnings: ({"items": []}, {"items": []})  # type: ignore[assignment]
     progressive_client.cluster_info = lambda warnings: ("test-context", "test-user", "v1.test")  # type: ignore[assignment]
@@ -10249,13 +11908,13 @@ def run_self_test() -> int:
     log_app.draw_logs_plain(0, 0, 2, 20)
     assert [write[2] for write in log_screen.writes] == ["alpha", "beta"]
     log_app.filters["logs"] = "alpha"
-    assert log_app.filtered_log_lines(20) == ["alpha", "beta"]
+    assert list(log_app.filtered_log_lines(20)) == ["alpha", "beta"]
     assert log_app.search_match_lines(log_app.filtered_log_lines(20), "alpha", log_app.log_filter_error) == [0]
     assert log_app.query_match_spans("alpha alpha", "alpha") == [(0, 5), (6, 11)]
     assert log_app.query_match_spans("use [literal]", "[", "unterminated character set") == [(4, 5)]
-    assert log_app.query_error("(a+)+$") == "potentially expensive nested repeat"
+    assert log_app.query_error("(a+)+$") == ""
     assert log_app.search_match_lines(["literal (a+)+$ pattern"], "(a+)+$") == [0]
-    assert log_app.query_error("x" * (MAX_SEARCH_REGEX_LENGTH + 1)).startswith("regex too long")
+    assert log_app.query_error("re:" + "x" * (MAX_SEARCH_REGEX_LENGTH + 1)).startswith("regex too long")
 
     viewer_screen = FakeScreen(cols=40)
     viewer_app.stdscr = viewer_screen
@@ -10297,16 +11956,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_self_test()
     normalize_display_scope(args, parser)
     try:
-        client = make_client(args)
+        if args.diff:
+            if args.replay or args.support_bundle or args.diagnostics:
+                raise DataError("--diff cannot be combined with replay, bundle or diagnostics")
+            before, after = [read_snapshot_file(path, args.max_output_bytes) for path in args.diff]
+            changes = compare_snapshots(before, after)
+            result = {"schema_version": 1, "before": isoformat_utc(before.loaded_at), "after": isoformat_utc(after.loaded_at), "changes": changes}
+            if args.output == "json":
+                print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+            else:
+                print(sanitize_terminal_output("Snapshot diff %s -> %s\n%s" % (result["before"], result["after"],
+                    "\n".join("%s %s/%s/%s uid=%s %s" % (c["change"], c["kind"], c["namespace"], c["name"], c["uid"], json.dumps(c.get("fields", {}), ensure_ascii=False)) for c in changes) or "No observed changes")))
+            return 0
+        client = ReplayClient(args.replay, args.max_output_bytes) if args.replay else make_client(args)
+        if args.support_bundle:
+            snapshot = load_dump_snapshot(client, args)
+            write_support_bundle(args.support_bundle, support_bundle(snapshot, args), args.max_output_bytes)
+            print(sanitize_terminal_output("Support bundle written: " + args.support_bundle))
+            return 0
+        if args.bundle_namespace or args.bundle_object:
+            raise DataError("bundle selectors require --support-bundle")
         if args.diagnostics:
-            print("\n".join(client.diagnostics_lines()))
+            print(sanitize_terminal_output("\n".join(client.diagnostics_lines())))
             return 0
         if args.dump:
             snapshot = load_dump_snapshot(client, args)
             if args.output == "json":
                 print(dump_snapshot_json(snapshot, args))
             else:
-                print(dump_snapshot(snapshot, args))
+                print(sanitize_terminal_output(dump_snapshot(snapshot, args)))
             return 0
         try:
             locale.setlocale(locale.LC_ALL, "")
@@ -10317,7 +11995,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except KeyboardInterrupt:
         return 130
     except DataError as exc:
-        print("ktop-py.py: %s" % exc, file=sys.stderr)
+        print(sanitize_terminal_output("ktop-py.py: %s" % exc), file=sys.stderr)
         return 2
 
 

@@ -640,6 +640,37 @@ Use ASCII fallback only when the terminal font cannot display block glyphs:
 KTOP_PY_GRAPH_STYLE=ascii ./ktop-py.py
 ```
 
+## Incident Diagnostics
+
+Open the `F1` palette and select one of these views:
+
+- `Network Service/EndpointSlice/Pod` — static Service → EndpointSlice → Pod relationships, endpoint readiness, selector mismatches, and related Ingresses and NetworkPolicies. It does not send application traffic.
+- `Degradation evidence` — OOMKilled/exit codes, init containers, Ready/Initialized conditions, probe Events, ephemeral-storage pressure, and CFS throttling. Source state and unavailable evidence are explicit.
+- `Incident timeline` — Events and status/Ready/restart/rollout changes observed between refreshes. The buffer is bounded to 1,000 entries.
+- `Workload securityContext` — declared settings from Pods and workload templates. It provides configuration context and does not claim compromise.
+
+Network objects load after the page is first opened. Read-only list permissions for Services, EndpointSlices, Ingresses, and NetworkPolicies are required for complete output.
+
+## Offline Replay, Diff, and Support Bundles
+
+Every JSON dump has `schema_version: 1` and contains a normalized replay snapshot:
+
+```bash
+./ktop-py.py --dump --output json > before.json
+./ktop-py.py --dump --output json > after.json
+./ktop-py.py --diff before.json after.json --output json
+./ktop-py.py --replay before.json after.json
+```
+
+Replay never contacts Kubernetes; `F5` and `F6` switch snapshots. Diff requires matching cluster/context identities and chronological order. UID is the primary identity; absent UIDs are marked `name-only`. Incomplete scope is not interpreted as object deletion.
+
+```bash
+./ktop-py.py --support-bundle support.json --bundle-namespace production
+./ktop-py.py --support-bundle pod.json --bundle-object Pod/production/api --include-raw
+```
+
+Bundles are written atomically with mode 0600 and include snapshot age, source states, and selected scope. Raw objects require `--include-raw`; env, annotations, data, commands, credential-like keys, and event/status/warning free text are removed, while network and security inventory findings remain available. Redaction cannot guarantee discovery of secrets in arbitrary strings.
+
 ## JSON Dump
 
 Dump mode prints one snapshot and exits:
@@ -649,7 +680,7 @@ Dump mode prints one snapshot and exits:
 ./ktop-py.py --dump --output json
 ```
 
-JSON includes cluster metadata, nodes, pods, containers, CronJob diagnostics, metrics status, warnings, and loaded timestamp.
+JSON includes `schema_version`, a normalized replay snapshot, cluster metadata, nodes, pods, containers, CronJob and incident diagnostics/timeline, metrics status, warnings, and loaded timestamp. The replay record increases file size.
 
 Pod selection options:
 

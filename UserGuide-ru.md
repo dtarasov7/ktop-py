@@ -640,6 +640,37 @@ ASCII fallback нужен только если terminal font не показы�
 KTOP_PY_GRAPH_STYLE=ascii ./ktop-py.py
 ```
 
+## Диагностика инцидентов
+
+Откройте палитру `F1` и выберите один из экранов:
+
+- `Network Service/EndpointSlice/Pod` — статическая цепочка Service → EndpointSlice → Pod, readiness endpoints, selector mismatch, связанные Ingress и NetworkPolicy. Экран не выполняет сетевые запросы к приложению.
+- `Degradation evidence` — OOMKilled/exit code, init-контейнеры, Ready/Initialized conditions, probe Events, ephemeral-storage pressure и CFS throttling. Состояние источника и отсутствие данных показаны явно.
+- `Incident timeline` — Events и изменения status/Ready/restarts/rollout, замеченные между refresh. Буфер ограничен 1000 строками.
+- `Workload securityContext` — declared securityContext Pod и workload template. Экран показывает контекст настройки и не утверждает, что объект скомпрометирован.
+
+Network-ресурсы загружаются после первого открытия экрана. Нужны read-only list permissions на Services, EndpointSlices, Ingresses и NetworkPolicies.
+
+## Offline replay, diff и support bundle
+
+Каждый JSON dump имеет `schema_version: 1` и содержит нормализованный replay snapshot:
+
+```bash
+./ktop-py.py --dump --output json > before.json
+./ktop-py.py --dump --output json > after.json
+./ktop-py.py --diff before.json after.json --output json
+./ktop-py.py --replay before.json after.json
+```
+
+Replay не обращается к Kubernetes; `F5` и `F6` переключают снимки. Diff требует одинаковые cluster/context и хронологический порядок. UID используется как основная identity; при его отсутствии результат помечен `name-only`. Неполный scope не интерпретируется как удаление объекта.
+
+```bash
+./ktop-py.py --support-bundle support.json --bundle-namespace production
+./ktop-py.py --support-bundle pod.json --bundle-object Pod/production/api --include-raw
+```
+
+Bundle записывается атомарно с mode 0600 и содержит возраст snapshot, source status и scope. Raw добавляется только через `--include-raw`; env, annotations, data, commands, credential-подобные ключи и свободный текст событий, статусов и предупреждений маскируются, а результаты инвентаризации сети и security context сохраняются. Маскирование не гарантирует поиск секретов в любых произвольных строках.
+
 ## JSON Dump
 
 Dump mode печатает один snapshot и завершает процесс:
@@ -649,7 +680,7 @@ Dump mode печатает один snapshot и завершает процес�
 ./ktop-py.py --dump --output json
 ```
 
-JSON включает cluster metadata, nodes, pods, containers, CronJob diagnostics, metrics status, warnings и loaded timestamp.
+JSON включает `schema_version`, нормализованный replay snapshot, cluster metadata, nodes, pods, containers, CronJob diagnostics, incident diagnostics/timeline, metrics status, warnings и loaded timestamp. Replay-секция увеличивает размер файла.
 
 Опции выбора pods:
 
